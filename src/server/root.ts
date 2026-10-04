@@ -7,25 +7,36 @@ import {
   closeRequest,
   createRequest,
   extendRequest,
+  liftRestriction,
   recordExport,
   resolveConflict,
   saveRequest,
   taskAction,
   verifyIdentity,
+  RevisionConflictError,
 } from '@/services/requestService'
+import {
+  createDispatchBatch,
+  retryDispatchBatch,
+  setSystemStatus,
+} from '@/services/scheduler'
 import { createInitialState } from '@/services/mockData'
 import {
   assignTaskInputSchema,
   closeRequestInputSchema,
   commentInputSchema,
   conflictInputSchema,
+  createDispatchBatchInputSchema,
   createRequestInputSchema,
   evidenceInputSchema,
   extendRequestInputSchema,
   identityInputSchema,
+  liftRestrictionInputSchema,
   recordExportInputSchema,
   resolveConflictInputSchema,
+  retryDispatchBatchInputSchema,
   saveRequestInputSchema,
+  setSystemStatusInputSchema,
   taskActionInputSchema,
 } from '@/lib/schemas'
 import type { WorkspaceState } from '@/types/domain'
@@ -37,6 +48,9 @@ function execute(operation: () => WorkspaceState): WorkspaceState {
   try {
     return operation()
   } catch (error) {
+    if (error instanceof RevisionConflictError) {
+      throw new TRPCError({ code: 'CONFLICT', message: error.message })
+    }
     throw new TRPCError({
       code: 'BAD_REQUEST',
       message: error instanceof Error ? error.message : '请求处理失败',
@@ -57,13 +71,28 @@ export const appRouter = t.router({
     save: publicProcedure
       .input(saveRequestInputSchema)
       .mutation(({ input }) =>
-        execute(() => saveRequest(input.state, input.requestId, input.patch, input.operator)),
+        execute(() =>
+          saveRequest(
+            input.state,
+            input.requestId,
+            input.patch,
+            input.operator,
+            input.expectedRevision,
+          ),
+        ),
       ),
     verifyIdentity: publicProcedure
       .input(identityInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          verifyIdentity(input.state, input.requestId, input.status, input.note, input.operator),
+          verifyIdentity(
+            input.state,
+            input.requestId,
+            input.status,
+            input.note,
+            input.operator,
+            input.expectedRevision,
+          ),
         ),
       ),
     assignTask: publicProcedure
@@ -76,6 +105,7 @@ export const appRouter = t.router({
             input.taskId,
             input.assignee,
             input.operator,
+            input.expectedRevision,
           ),
         ),
       ),
@@ -90,6 +120,7 @@ export const appRouter = t.router({
             input.action,
             input.note,
             input.operator,
+            input.expectedRevision,
           ),
         ),
       ),
@@ -104,6 +135,7 @@ export const appRouter = t.router({
             input.name,
             input.evidenceType,
             input.operator,
+            input.expectedRevision,
           ),
         ),
       ),
@@ -111,7 +143,13 @@ export const appRouter = t.router({
       .input(conflictInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          addConflict(input.state, input.requestId, input.conflict, input.operator),
+          addConflict(
+            input.state,
+            input.requestId,
+            input.conflict,
+            input.operator,
+            input.expectedRevision,
+          ),
         ),
       ),
     resolveConflict: publicProcedure
@@ -124,6 +162,7 @@ export const appRouter = t.router({
             input.conflictIndex,
             input.resolution,
             input.operator,
+            input.expectedRevision,
           ),
         ),
       ),
@@ -137,6 +176,7 @@ export const appRouter = t.router({
             input.days,
             input.reason,
             input.operator,
+            input.expectedRevision,
           ),
         ),
       ),
@@ -150,6 +190,20 @@ export const appRouter = t.router({
             input.resultSummary,
             input.closureReason,
             input.operator,
+            input.expectedRevision,
+          ),
+        ),
+      ),
+    liftRestriction: publicProcedure
+      .input(liftRestrictionInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          liftRestriction(
+            input.state,
+            input.requestId,
+            input.reason,
+            input.operator,
+            input.expectedRevision,
           ),
         ),
       ),
@@ -157,7 +211,13 @@ export const appRouter = t.router({
       .input(commentInputSchema)
       .mutation(({ input }) =>
         execute(() =>
-          addComment(input.state, input.requestId, input.content, input.operator),
+          addComment(
+            input.state,
+            input.requestId,
+            input.content,
+            input.operator,
+            input.expectedRevision,
+          ),
         ),
       ),
     recordExport: publicProcedure
@@ -165,6 +225,32 @@ export const appRouter = t.router({
       .mutation(({ input }) =>
         execute(() =>
           recordExport(input.state, input.scope, input.count, input.operator),
+        ),
+      ),
+  }),
+  dispatch: t.router({
+    createBatch: publicProcedure
+      .input(createDispatchBatchInputSchema)
+      .mutation(({ input }) =>
+        execute(() => createDispatchBatch(input.state, input.operator)),
+      ),
+    retryBatch: publicProcedure
+      .input(retryDispatchBatchInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          retryDispatchBatch(input.state, input.batchId, input.operator),
+        ),
+      ),
+    setSystemStatus: publicProcedure
+      .input(setSystemStatusInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          setSystemStatus(
+            input.state,
+            input.systemId,
+            input.status,
+            input.operator,
+          ),
         ),
       ),
   }),

@@ -136,6 +136,12 @@ a {
   border-color: #e7a7a0;
 }
 
+.timeline-item:has(.suspended-marker),
+.timeline-item.suspended {
+  background: #f5f0ff;
+  border-color: #b79af0;
+}
+
 .summary-box {
   padding: 12px 14px;
   margin-bottom: 10px;

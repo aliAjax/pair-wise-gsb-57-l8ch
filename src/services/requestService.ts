@@ -6,10 +6,16 @@ import type {
   WorkspaceState,
 } from '@/types/domain'
 import { addDays, buildWorkflowSteps, responseDays } from './workflow'
+import {
+  assignRegisteredSequences,
+  releaseHeldTasks,
+  synchronizeScheduling,
+} from './scheduler'
 
 const cloneState = (state: WorkspaceState): WorkspaceState => structuredClone(state)
 const now = () => new Date().toISOString()
 const id = (prefix: string) => `${prefix}-${crypto.randomUUID()}`
+const DEFAULT_RESTRICTION_DAYS = 30
 
 function digest(value: string): string {
   let hash = 2166136261
@@ -18,6 +24,28 @@ function digest(value: string): string {
     hash = Math.imul(hash, 16777619)
   }
   return `PD-${(hash >>> 0).toString(16).toUpperCase().padStart(8, '0')}`
+}
+
+export class RevisionConflictError extends Error {}
+
+/**
+ * 并发保护：后到动作必须识别新状态。调用方携带读取时的 revision，
+ * 期间工作区被其他操作改动则拒绝本次写入，避免覆盖已经回执的项。
+ */
+function prepareState(
+  state: WorkspaceState,
+  expectedRevision?: number,
+): WorkspaceState {
+  if (expectedRevision !== undefined && state.revision !== expectedRevision) {
+    throw new RevisionConflictError(
+      `工作区版本已变化（当前 ${state.revision}，操作基于 ${expectedRevision}），请刷新后重试，已回执项不会被覆盖。`,
+    )
+  }
+  const draft = cloneState(state)
+  if (!draft.dispatchBatches) draft.dispatchBatches = []
+  // 每个变更操作前先同步排程：限制到期/生效、批次检查点对齐。
+  synchronizeScheduling(draft)
+  return draft
 }
 
 function appendAudit(
@@ -50,14 +78,28 @@ function mutateRequest(
   requestId: string,
   mutation: (request: PrivacyRequest, draft: WorkspaceState) => void,
   audit: { action: string; operator: string; detail: string },
+  expectedRevision?: number,
 ): WorkspaceState {
-  const draft = cloneState(state)
+  const draft = prepareState(state, expectedRevision)
   const request = draft.requests.find((item) => item.id === requestId)
   if (!request) throw new Error('请求不存在')
   mutation(request, draft)
+  synchronizeScheduling(draft, { operator: audit.operator })
   appendAudit(draft, request, audit.action, audit.operator, audit.detail)
   draft.revision += 1
   return draft
+}
+
+/** 解除限制后，按请求当前冲突/核验情况重算复核状态。 */
+function recomputeStatus(request: PrivacyRequest): void {
+  if (['completed', 'rejected'].includes(request.status)) return
+  const stillHeld = request.tasks.some((task) => task.heldByRequestId)
+  request.status =
+    request.conflicts.length || request.identity.status === 'insufficient' || stillHeld
+      ? 'review-required'
+      : request.identity.status === 'verified'
+        ? 'processing'
+        : 'identity-review'
 }
 
 export interface CreateRequestInput {
@@ -69,6 +111,7 @@ export interface CreateRequestInput {
   identityMaterialType: IdentityCheck['materialType']
   identityReference: string
   note: string
+  restrictionDurationDays?: number
 }
 
 export function createRequest(
@@ -76,7 +119,7 @@ export function createRequest(
   input: CreateRequestInput,
   operator: string,
 ): WorkspaceState {
-  const draft = cloneState(state)
+  const draft = prepareState(state)
   const requestedAt = now()
   const dueAt = addDays(new Date(requestedAt), responseDays[input.region]).toISOString()
   const duplicate = draft.requests.find(
@@ -94,6 +137,7 @@ export function createRequest(
       ...draft.requests.map((request) => Number(request.code.split('-').at(-1)) || 0),
     ) + 1
   const requestId = id('request')
+  const durationDays = input.restrictionDurationDays ?? DEFAULT_RESTRICTION_DAYS
   const request: PrivacyRequest = {
     id: requestId,
     code: `DSR-2026-${String(nextNumber).padStart(3, '0')}`,
@@ -127,6 +171,14 @@ export function createRequest(
     conflicts: [],
     resultSummary: '',
     closureReason: '',
+    restriction:
+      input.type === 'restriction'
+        ? {
+            status: 'pending',
+            durationDays,
+            suspendedTaskRefs: [],
+          }
+        : undefined,
     audit: [],
   }
   if (identityInsufficient) {
@@ -141,12 +193,16 @@ export function createRequest(
     request.conflicts.push(`疑似重复请求：与 ${duplicate.code} 的请求人和请求类型相同。`)
   }
   draft.requests.unshift(request)
+  assignRegisteredSequences(draft)
+  synchronizeScheduling(draft, { operator })
   appendAudit(
     draft,
     request,
     '登记隐私请求',
     operator,
-    `按 ${responseDays[input.region]} 日模板登记，涉及 ${input.affectedSystemIds.length} 个系统。`,
+    `按 ${responseDays[input.region]} 日模板登记，涉及 ${input.affectedSystemIds.length} 个系统${
+      input.type === 'restriction' ? `；限制期限预登记为 ${durationDays} 天，身份核验通过后生效。` : ''
+    }。`,
   )
   draft.revision += 1
   return draft
@@ -157,6 +213,7 @@ export function saveRequest(
   requestId: string,
   patch: Partial<PrivacyRequest>,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -166,6 +223,7 @@ export function saveRequest(
       request.audit = request.audit
     },
     { action: '更新请求信息', operator, detail: '更新申请人、地区、请求类型或涉及系统。' },
+    expectedRevision,
   )
 }
 
@@ -175,11 +233,12 @@ export function verifyIdentity(
   status: 'verified' | 'insufficient',
   note: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
     requestId,
-    (request) => {
+    (request, draft) => {
       request.identity.status = status
       request.identity.note = note
       request.identity.reviewedAt = now()
@@ -193,13 +252,44 @@ export function verifyIdentity(
         request.conflicts = request.conflicts.filter(
           (conflict) => !conflict.startsWith('身份材料不足'),
         )
-        const nextTask = request.tasks.find((task) => task.status === 'pending')
-        if (nextTask) nextTask.status = 'active'
-        request.status = request.conflicts.length ? 'review-required' : 'processing'
+        if (request.type === 'restriction') {
+          // 身份核验通过，限制处理即时生效，排程同步会挂起同一数据主体的清除/更正任务。
+          const effectiveAt = now()
+          request.restriction = {
+            status: 'active',
+            effectiveAt,
+            expiresAt: addDays(
+              new Date(effectiveAt),
+              request.restriction?.durationDays ?? DEFAULT_RESTRICTION_DAYS,
+            ).toISOString(),
+            durationDays: request.restriction?.durationDays ?? DEFAULT_RESTRICTION_DAYS,
+            suspendedTaskRefs: request.restriction?.suspendedTaskRefs ?? [],
+          }
+        }
+        const nextTask = request.tasks.find(
+          (task) => task.status === 'pending' || task.status === 'suspended',
+        )
+        if (nextTask && nextTask.status === 'pending') nextTask.status = 'active'
+        recomputeStatus(request)
+        if (request.type === 'restriction' && request.restriction?.status === 'active') {
+          appendAudit(
+            draft,
+            request,
+            '限制处理生效',
+            operator,
+            `限制处理请求生效至 ${request.restriction.expiresAt}；同一数据主体的清除和更正任务停在待复核，不向数据系统下发。`,
+          )
+        }
       } else {
         if (identityTask) {
           identityTask.status = 'blocked'
           identityTask.exceptionReason = note
+        }
+        if (request.type === 'restriction' && request.restriction) {
+          request.restriction.status = 'pending'
+          request.restriction.effectiveAt = undefined
+          request.restriction.expiresAt = undefined
+          request.restriction.liftedAt = undefined
         }
         request.status = 'review-required'
         if (!request.conflicts.some((conflict) => conflict.startsWith('身份材料不足'))) {
@@ -212,6 +302,7 @@ export function verifyIdentity(
       operator,
       detail: note,
     },
+    expectedRevision,
   )
 }
 
@@ -221,6 +312,7 @@ export function assignTask(
   taskId: string,
   assignee: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -228,9 +320,14 @@ export function assignTask(
     (request) => {
       const task = request.tasks.find((item) => item.id === taskId)
       if (!task) throw new Error('任务不存在')
+      if (task.acknowledged) {
+        throw new Error('该任务已取得数据系统回执，责任人随回执锁定，不能再分派。')
+      }
+      // 暂缓任务允许分派给复核人员，但不能下发数据系统。
       task.assignee = assignee
     },
     { action: '分派履约任务', operator, detail: `任务 ${taskId} 分派给 ${assignee}。` },
+    expectedRevision,
   )
 }
 
@@ -241,6 +338,7 @@ export function taskAction(
   action: 'start' | 'complete' | 'block',
   note: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -252,13 +350,38 @@ export function taskAction(
       const task = request.tasks.find((item) => item.id === taskId)
       if (!task) throw new Error('任务不存在')
       if (action === 'start') {
+        if (task.status === 'suspended') {
+          throw new Error(
+            `任务被限制处理请求 ${task.heldByRequestCode ?? ''} 暂缓，停在待复核，限制解除前不能开始或下发。`,
+          )
+        }
+        if (task.acknowledged) {
+          throw new Error('任务已取得数据系统回执，无需重复开始。')
+        }
         task.status = 'active'
         task.exceptionReason = ''
       } else if (action === 'complete') {
+        if (task.status === 'suspended') {
+          throw new Error(
+            `任务被限制处理请求 ${task.heldByRequestCode ?? ''} 暂缓，限制解除前不能完成或下发。`,
+          )
+        }
+        if (task.status === 'completed' || task.acknowledged) {
+          // 后到动作识别新状态：不能覆盖已经回执的项。
+          throw new Error(
+            `任务已于 ${task.acknowledgedAt ?? task.completedAt ?? '此前'} 完成${task.receiptReference ? `并取得回执 ${task.receiptReference}` : ''}，重复提交被拒绝，回执不被覆盖。`,
+          )
+        }
         task.status = 'completed'
         task.completedAt = now()
         task.exceptionReason = ''
-        const nextTask = request.tasks.find((item) => item.status === 'pending')
+        // 仅当所有更早的任务已完成（且无暂缓）时推进下一任务，保证顺序。
+        const earlierPending = request.tasks.some(
+          (item) => item.order < task.order && item.status !== 'completed',
+        )
+        const nextTask = request.tasks.find(
+          (item) => item.order > task.order && item.status === 'pending' && !earlierPending,
+        )
         if (nextTask) nextTask.status = 'active'
       } else {
         task.status = 'blocked'
@@ -270,7 +393,7 @@ export function taskAction(
       if (executableTasks.every((item) => item.status === 'completed')) {
         request.status = 'pending-close'
       } else if (action !== 'block') {
-        request.status = 'processing'
+        recomputeStatus(request)
       }
     },
     {
@@ -279,6 +402,7 @@ export function taskAction(
       operator,
       detail: note || `${taskId} 状态更新为 ${action}。`,
     },
+    expectedRevision,
   )
 }
 
@@ -289,6 +413,7 @@ export function addEvidence(
   name: string,
   evidenceType: 'execution-log' | 'screenshot' | 'signed-record' | 'system-response',
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -312,6 +437,7 @@ export function addEvidence(
       operator,
       detail: `${name} 已按受保护附件登记，保存摘要而非明文材料。`,
     },
+    expectedRevision,
   )
 }
 
@@ -320,6 +446,7 @@ export function addConflict(
   requestId: string,
   conflict: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -329,6 +456,7 @@ export function addConflict(
       request.status = 'review-required'
     },
     { action: '标记冲突或例外', operator, detail: conflict },
+    expectedRevision,
   )
 }
 
@@ -338,6 +466,7 @@ export function resolveConflict(
   conflictIndex: number,
   resolution: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -346,13 +475,10 @@ export function resolveConflict(
       const conflict = request.conflicts[conflictIndex]
       if (!conflict) throw new Error('冲突项不存在')
       request.conflicts.splice(conflictIndex, 1)
-      if (!request.conflicts.length && request.identity.status === 'verified') {
-        request.status = 'processing'
-      } else {
-        request.status = 'review-required'
-      }
+      recomputeStatus(request)
     },
     { action: '复核处理冲突', operator, detail: resolution },
+    expectedRevision,
   )
 }
 
@@ -362,6 +488,7 @@ export function extendRequest(
   days: number,
   reason: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -373,6 +500,7 @@ export function extendRequest(
       request.status = 'extended'
     },
     { action: '延期请求处理', operator, detail: `延期 ${days} 天：${reason}` },
+    expectedRevision,
   )
 }
 
@@ -382,6 +510,7 @@ export function closeRequest(
   resultSummary: string,
   closureReason: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
   return mutateRequest(
     state,
@@ -393,6 +522,9 @@ export function closeRequest(
       const requiredTasks = request.tasks.filter((task) => !task.id.endsWith('-close'))
       if (requiredTasks.some((task) => task.status !== 'completed')) {
         throw new Error('仍有未完成任务，不能关闭请求')
+      }
+      if (request.tasks.some((task) => task.heldByRequestId)) {
+        throw new Error('仍存在被限制处理暂缓的任务，不能关闭请求')
       }
       if (request.conflicts.length) {
         throw new Error('仍有未解决冲突，不能关闭请求')
@@ -414,7 +546,48 @@ export function closeRequest(
       operator,
       detail: closureReason ? `提前关闭理由：${closureReason}` : '截止时间后完成关闭。',
     },
+    expectedRevision,
   )
+}
+
+/**
+ * 管理员撤回限制处理。解除后等待任务按原登记顺序重新下发，
+ * 已成功回执的清除/更正不受影响、不回滚。
+ */
+export function liftRestriction(
+  state: WorkspaceState,
+  requestId: string,
+  reason: string,
+  operator: string,
+  expectedRevision?: number,
+): WorkspaceState {
+  const draft = prepareState(state, expectedRevision)
+  const request = draft.requests.find((item) => item.id === requestId)
+  if (!request) throw new Error('请求不存在')
+  if (request.type !== 'restriction' || !request.restriction) {
+    throw new Error('该请求不是限制处理请求')
+  }
+  if (request.restriction.status !== 'active') {
+    throw new Error(
+      `限制处理当前状态为「${request.restriction.status}」，仅生效中的限制可以撤回解除。`,
+    )
+  }
+  const at = now()
+  request.restriction.status = 'withdrawn'
+  request.restriction.liftedAt = at
+  request.restriction.liftReason = reason
+  request.restriction.liftedBy = operator
+  releaseHeldTasks(draft, request, false, at)
+  synchronizeScheduling(draft, { operator })
+  appendAudit(
+    draft,
+    request,
+    '撤回解除限制处理',
+    operator,
+    `限制处理请求被撤回解除：${reason} 等待任务按原登记顺序恢复下发，已回执项不受影响。`,
+  )
+  draft.revision += 1
+  return draft
 }
 
 export function addComment(
@@ -422,8 +595,9 @@ export function addComment(
   requestId: string,
   content: string,
   operator: string,
+  expectedRevision?: number,
 ): WorkspaceState {
-  const draft = cloneState(state)
+  const draft = prepareState(state, expectedRevision)
   const request = draft.requests.find((item) => item.id === requestId)
   if (!request) throw new Error('请求不存在')
   draft.comments.unshift({

@@ -38,9 +38,9 @@ import {
   useDisclosure,
   useToast,
 } from '@chakra-ui/react'
-import { ArrowLeft, FileCheck2, Link2Off, ShieldAlert } from 'lucide-react'
+import { ArrowLeft, FileCheck2, Link2Off, ShieldAlert, PauseCircle } from 'lucide-react'
 import { PageHeader } from '@/components/PageHeader'
-import { StatusBadge, TypeBadge } from '@/components/StatusBadge'
+import { StatusBadge, TaskStatusBadge, TypeBadge } from '@/components/StatusBadge'
 import {
   useAddCommentMutation,
   useAddConflictMutation,
@@ -48,6 +48,7 @@ import {
   useAssignTaskMutation,
   useCloseRequestMutation,
   useExtendRequestMutation,
+  useLiftRestrictionMutation,
   useResolveConflictMutation,
   useSaveRequestMutation,
   useTaskActionMutation,
@@ -57,6 +58,8 @@ import {
 import {
   regionLabels,
   requestTypeLabels,
+  restrictionStatusLabels,
+  dispatchItemStatusLabels,
   type Region,
   type RequestType,
   type WorkflowStep,
@@ -73,6 +76,7 @@ type DialogType =
   | 'resolve'
   | 'extend'
   | 'close'
+  | 'lift'
   | null
 
 export function RequestDetailPage({ requestId }: { requestId: string }) {
@@ -108,9 +112,32 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const extendRequest = useExtendRequestMutation()
   const closeRequest = useCloseRequestMutation()
   const addComment = useAddCommentMutation()
+  const liftRestriction = useLiftRestrictionMutation()
 
   const comments = useMemo(
     () => data?.comments.filter((comment) => comment.requestId === requestId) ?? [],
+    [data, requestId],
+  )
+
+  const suspension = useMemo(() => {
+    if (!data || !request) return null
+    if (!request.tasks.some((task) => task.heldByRequestId)) return null
+    const held = request.tasks.find((task) => task.heldByRequestId)
+    const basis = held?.heldByRequestId
+      ? data.requests.find((item) => item.id === held.heldByRequestId)
+      : undefined
+    return { held, basis }
+  }, [data, request])
+
+  const ownRestriction = request?.type === 'restriction' ? request.restriction : undefined
+
+  const batchItems = useMemo(
+    () =>
+      (data?.dispatchBatches ?? []).flatMap((batch) =>
+        batch.items
+          .filter((item) => item.requestId === requestId)
+          .map((item) => ({ batch, item })),
+      ),
     [data, requestId],
   )
 
@@ -119,7 +146,9 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
 
   const deadline = deadlineState(request.dueAt)
   const completedTasks = request.tasks.filter((task) => task.status === 'completed').length
-  const currentTask = request.tasks.find((task) => task.status === 'active')
+  const currentTask =
+    request.tasks.find((task) => task.status === 'active') ??
+    request.tasks.find((task) => task.status === 'suspended')
   const systems = data.systems.filter((system) => request.affectedSystemIds.includes(system.id))
 
   function openDialog(type: DialogType, task?: WorkflowStep, index = 0) {
@@ -256,6 +285,16 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           }),
         '请求已完成并关闭',
       )
+    } else if (dialog === 'lift') {
+      await run(
+        () =>
+          liftRestriction.mutateAsync({
+            requestId,
+            reason: content,
+            operator: '隐私负责人',
+          }),
+        '限制处理已撤回解除，等待任务按原顺序恢复下发',
+      )
     }
   }
 
@@ -288,6 +327,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
     resolve: '记录冲突复核结论',
     extend: '延期处理请求',
     close: '关闭请求并合并结果',
+    lift: '撤回解除限制处理',
   }
 
   return (
@@ -372,8 +412,26 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           系统检测到与 {request.duplicateOf} 疑似重复，已保留原请求证据并要求人工复核。
         </Alert>
       ) : null}
+      {suspension ? (
+        <Alert status="warning" mb="4" borderRadius="5px">
+          <PauseCircle size={18} style={{ marginRight: 8, flexShrink: 0 }} />
+          <Box>
+            <Text fontWeight="600">
+              本请求有 {request.tasks.filter((task) => task.heldByRequestId).length} 项清除/更正任务暂缓，停在待复核，未向数据系统下发。
+            </Text>
+            <Text mt="1" fontSize="sm">
+              暂缓依据：限制处理请求
+              {suspension.basis ? ` ${suspension.basis.code}` : ` ${suspension.held?.heldByRequestCode ?? ''}`}
+              {suspension.basis?.restriction?.expiresAt
+                ? `（生效至 ${new Date(suspension.basis.restriction.expiresAt).toLocaleString('zh-CN')} 到期）`
+                : ''}
+              ；限制到期或撤回后按原登记顺序恢复下发。
+            </Text>
+          </Box>
+        </Alert>
+      ) : null}
 
-      <div className="two-column">
+      <div className={ownRestriction ? 'three-column' : 'two-column'}>
         <Box className="panel">
           <Flex className="panel-title">
             <Heading size="sm">请求与身份核验</Heading>
@@ -468,6 +526,83 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             每个系统分别执行并登记证据，合并结果时不得覆盖原始时间点。
           </Alert>
         </Box>
+
+        {ownRestriction ? (
+          <Box className="panel">
+            <Flex className="panel-title">
+              <Heading size="sm">限制处理生命周期</Heading>
+              <Badge
+                colorScheme={
+                  ownRestriction.status === 'active'
+                    ? 'purple'
+                    : ownRestriction.status === 'pending'
+                      ? 'orange'
+                      : 'green'
+                }
+              >
+                {restrictionStatusLabels[ownRestriction.status]}
+              </Badge>
+            </Flex>
+            <VStack align="stretch" spacing="3">
+              <Box p="3" bg="purple.50" borderRadius="5px">
+                <Text fontWeight="600">生效时间</Text>
+                <Text mt="1" color="gray.600" fontSize="sm">
+                  {ownRestriction.effectiveAt
+                    ? new Date(ownRestriction.effectiveAt).toLocaleString('zh-CN')
+                    : '身份核验通过后生效'}
+                </Text>
+              </Box>
+              <Box p="3" bg="purple.50" borderRadius="5px">
+                <Text fontWeight="600">到期时间</Text>
+                <Text mt="1" color="gray.600" fontSize="sm">
+                  {ownRestriction.expiresAt
+                    ? new Date(ownRestriction.expiresAt).toLocaleString('zh-CN')
+                    : `期限 ${ownRestriction.durationDays} 天`}
+                </Text>
+              </Box>
+              <Box p="3" bg="gray.50" borderRadius="5px">
+                <Text fontWeight="600">
+                  暂缓任务（{ownRestriction.suspendedTaskRefs.length}）
+                </Text>
+                <VStack align="stretch" mt="2" spacing="1">
+                  {ownRestriction.suspendedTaskRefs.length ? (
+                    ownRestriction.suspendedTaskRefs.map((ref) => (
+                      <Box key={ref.taskId} fontSize="sm">
+                        <Text>
+                          {ref.requestCode} · {ref.taskName}
+                        </Text>
+                        <Text color={ref.releasedAt ? 'green.600' : 'purple.600'} fontSize="xs">
+                          {ref.releasedAt
+                            ? `已于 ${new Date(ref.releasedAt).toLocaleString('zh-CN')} 恢复下发`
+                            : `自 ${new Date(ref.heldAt).toLocaleString('zh-CN')} 暂缓待复核`}
+                        </Text>
+                      </Box>
+                    ))
+                  ) : (
+                    <Text color="gray.500" fontSize="sm">
+                      暂无需暂缓的同一数据主体清除/更正任务。
+                    </Text>
+                  )}
+                </VStack>
+              </Box>
+              {ownRestriction.status === 'active' ? (
+                <Button
+                  size="sm"
+                  colorScheme="purple"
+                  variant="outline"
+                  onClick={() => openDialog('lift')}
+                >
+                  撤回解除限制
+                </Button>
+              ) : (
+                <Alert status="success" borderRadius="5px" fontSize="sm">
+                  {ownRestriction.liftReason ??
+                    restrictionStatusLabels[ownRestriction.status]}
+                </Alert>
+              )}
+            </VStack>
+          </Box>
+        ) : null}
       </div>
 
       <div className="three-column">
@@ -479,6 +614,33 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             </Badge>
           </Flex>
           {currentTask ? (
+            currentTask.status === 'suspended' ? (
+              <VStack align="stretch" spacing="3">
+                <Text fontWeight="600">{currentTask.name}</Text>
+                <Alert status="warning" borderRadius="5px">
+                  <PauseCircle size={16} style={{ marginRight: 8, flexShrink: 0 }} />
+                  <Box>
+                    <Text fontWeight="600" fontSize="sm">
+                      暂缓待复核，不向数据系统下发
+                    </Text>
+                    <Text mt="1" fontSize="xs">
+                      依据：限制处理请求 {currentTask.heldByRequestCode}
+                    </Text>
+                    <Text mt="1" fontSize="xs" color="gray.600">
+                      {currentTask.heldReason}
+                    </Text>
+                  </Box>
+                </Alert>
+                <Button
+                  size="sm"
+                  colorScheme="red"
+                  variant="outline"
+                  onClick={() => openDialog('block', currentTask)}
+                >
+                  标记其他阻断
+                </Button>
+              </VStack>
+            ) : (
             <VStack align="stretch" spacing="3">
               <Text fontWeight="600">{currentTask.name}</Text>
               <Text color="gray.600" fontSize="sm">
@@ -509,6 +671,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                 阻断并复核
               </Button>
             </VStack>
+            )
           ) : (
             <Alert status="success" borderRadius="5px">
               当前没有活动任务，可检查冲突并关闭请求。
@@ -536,7 +699,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             {request.tasks.map((task) => (
               <Box
                 key={task.id}
-                className={`timeline-item ${task.status === 'active' ? 'active' : ''} ${task.status === 'blocked' ? 'blocked' : ''}`}
+                className={`timeline-item ${task.status === 'active' ? 'active' : ''} ${task.status === 'blocked' ? 'blocked' : ''} ${task.status === 'suspended' ? 'suspended' : ''}`}
               >
                 <Flex justify="space-between" gap="4">
                   <Box>
@@ -547,34 +710,38 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                     <Text mt="1" color="gray.600" fontSize="sm">
                       {task.role} · {task.assignee}
                     </Text>
-                    {task.exceptionReason ? (
+                    {task.status === 'suspended' && task.heldByRequestCode ? (
+                      <Box mt="1" color="purple.700" fontSize="sm">
+                        <HStack>
+                          <PauseCircle size={14} />
+                          <Text fontWeight="600">暂缓待复核</Text>
+                        </HStack>
+                        <Text mt="1">依据：限制处理请求 {task.heldByRequestCode}</Text>
+                        <Text color="gray.600">{task.heldReason}</Text>
+                      </Box>
+                    ) : task.exceptionReason ? (
                       <Text mt="1" color="red.600" fontSize="sm">
                         {task.exceptionReason}
                       </Text>
                     ) : null}
+                    {task.receiptReference ? (
+                      <Text mt="1" color="green.700" fontSize="xs">
+                        已成功回执：<span className="mono">{task.receiptReference}</span>
+                        {task.acknowledgedAt
+                          ? ` · ${new Date(task.acknowledgedAt).toLocaleString('zh-CN')}`
+                          : ''}
+                      </Text>
+                    ) : null}
                   </Box>
                   <VStack align="flex-end" spacing="2">
-                    <Badge
-                      colorScheme={
-                        task.status === 'completed'
-                          ? 'green'
-                          : task.status === 'active'
-                            ? 'blue'
-                            : task.status === 'blocked'
-                              ? 'red'
-                              : 'gray'
-                      }
-                    >
-                      {task.status === 'completed'
-                        ? '已完成'
-                        : task.status === 'active'
-                          ? '执行中'
-                          : task.status === 'blocked'
-                            ? '已阻断'
-                            : '未开始'}
-                    </Badge>
+                    <TaskStatusBadge status={task.status} />
                     <HStack spacing="1">
-                      <Button size="xs" variant="ghost" onClick={() => openDialog('assign', task)}>
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        isDisabled={task.status === 'suspended'}
+                        onClick={() => openDialog('assign', task)}
+                      >
                         分派
                       </Button>
                       <Button size="xs" variant="ghost" onClick={() => openDialog('evidence', task)}>
@@ -637,6 +804,58 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                 暂无执行证据。
               </Text>
             ) : null}
+          </VStack>
+          <Divider my="4" />
+          <Heading size="xs" mb="3">
+            下发批次与回执
+          </Heading>
+          <VStack align="stretch" spacing="2">
+            {batchItems.length ? (
+              batchItems.map(({ batch, item }) => (
+                <Box key={item.id} className="summary-box">
+                  <Flex justify="space-between">
+                    <Text fontWeight="600" fontSize="sm">
+                      {batch.code} · {item.taskName}
+                    </Text>
+                    <Badge
+                      colorScheme={
+                        item.status === 'delivered'
+                          ? 'green'
+                          : item.status === 'held'
+                            ? 'purple'
+                            : item.status === 'failed'
+                              ? 'red'
+                              : 'gray'
+                      }
+                    >
+                      {dispatchItemStatusLabels[item.status]}
+                    </Badge>
+                  </Flex>
+                  <Text mt="1" color="gray.600" fontSize="xs">
+                    {item.systemName} · 尝试 {item.attempts} 次 · 登记顺序 #{item.registeredSequence}
+                  </Text>
+                  {item.status === 'delivered' && item.receiptReference ? (
+                    <Text mt="1" color="green.700" fontSize="xs">
+                      回执 <span className="mono">{item.receiptReference}</span>，成功项不重发。
+                    </Text>
+                  ) : null}
+                  {item.status === 'held' ? (
+                    <Text mt="1" color="purple.700" fontSize="xs">
+                      依据限制处理请求 {item.heldByRequestCode} 暂缓，限制解除后按检查点补送。
+                    </Text>
+                  ) : null}
+                  {item.status === 'failed' ? (
+                    <Text mt="1" color="red.600" fontSize="xs">
+                      {item.failureReason}
+                    </Text>
+                  ) : null}
+                </Box>
+              ))
+            ) : (
+              <Text color="gray.500" fontSize="sm">
+                尚未加入下发批次。
+              </Text>
+            )}
           </VStack>
         </Box>
       </div>
@@ -890,6 +1109,23 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                 <FormControl isRequired>
                   <FormLabel>延期原因</FormLabel>
                   <Textarea value={content} onChange={(event) => setContent(event.target.value)} />
+                </FormControl>
+              </VStack>
+            ) : null}
+
+            {dialog === 'lift' ? (
+              <VStack align="stretch" spacing="4">
+                <Alert status="warning" borderRadius="5px">
+                  撤回解除后，同一数据主体被暂缓的清除/更正任务将按原登记顺序重新下发；
+                  已成功回执的项不受影响、不会重发。
+                </Alert>
+                <FormControl isRequired>
+                  <FormLabel>撤回解除原因</FormLabel>
+                  <Textarea
+                    value={content}
+                    onChange={(event) => setContent(event.target.value)}
+                    placeholder="说明撤回限制处理的依据，例如争议已解决、数据主体书面请求等"
+                  />
                 </FormControl>
               </VStack>
             ) : null}

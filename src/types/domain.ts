@@ -1,13 +1,18 @@
 export type {
   DataSystem,
   AuditEntry,
+  DispatchBatch,
+  DispatchItem,
+  DispatchItemStatus,
   ExecutionEvidence,
   IdentityCheck,
   PrivacyRequest,
   Region,
   RequestStatus,
   RequestType,
+  RestrictionLifecycle,
   ReviewComment,
+  TaskStatus,
   WorkflowStep,
   WorkspaceState,
 } from '@/lib/schemas'

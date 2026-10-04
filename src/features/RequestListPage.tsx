@@ -62,6 +62,7 @@ const initialForm = {
     | 'none',
   identityReference: '',
   note: '',
+  restrictionDurationDays: 30,
 }
 
 export function RequestListPage() {
@@ -211,6 +212,15 @@ export function RequestListPage() {
                         {request.identity.status === 'insufficient' ? (
                           <Badge colorScheme="red">身份不足</Badge>
                         ) : null}
+                        {request.tasks.some((task) => task.heldByRequestId) ? (
+                          <Badge colorScheme="purple">
+                            暂缓 {request.tasks.filter((task) => task.heldByRequestId).length} 项 ·{' '}
+                            {request.tasks.find((task) => task.heldByRequestId)?.heldByRequestCode}
+                          </Badge>
+                        ) : null}
+                        {request.type === 'restriction' && request.restriction?.status === 'active' ? (
+                          <Badge colorScheme="purple">限制生效中</Badge>
+                        ) : null}
                         {request.conflicts.length ? (
                           <Badge colorScheme="red">{request.conflicts.length} 项冲突</Badge>
                         ) : null}
@@ -348,6 +358,24 @@ export function RequestListPage() {
                 placeholder="记录客户说明、材料范围和需要关注的处理要求"
               />
             </FormControl>
+
+            {form.type === 'restriction' ? (
+              <FormControl mt="4">
+                <FormLabel>限制期限（天）</FormLabel>
+                <Input
+                  type="number"
+                  min={1}
+                  max={180}
+                  value={form.restrictionDurationDays}
+                  onChange={(event) =>
+                    setForm({ ...form, restrictionDurationDays: Number(event.target.value) })
+                  }
+                />
+                <Text mt="1" color="purple.600" fontSize="xs">
+                  身份核验通过后即时生效；生效期间同一数据主体的清除和更正任务暂缓，到期自动解除。
+                </Text>
+              </FormControl>
+            ) : null}
 
             <Alert status="success" mt="4" borderRadius="5px">
               将生成：{templateName(form.region, form.type)}

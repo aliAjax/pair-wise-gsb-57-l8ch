@@ -44,6 +44,14 @@ export function DashboardPage() {
   const overdueRequests = openRequests.filter(
     (request) => new Date(request.dueAt).getTime() < Date.now(),
   )
+  const suspendedTasks = data.requests.reduce(
+    (total, request) =>
+      total + request.tasks.filter((task) => task.status === 'suspended').length,
+    0,
+  )
+  const activeRestrictions = data.requests.filter(
+    (request) => request.restriction?.status === 'active',
+  ).length
   const completedTasks = data.requests.reduce(
     (total, request) => total + request.tasks.filter((task) => task.status === 'completed').length,
     0,
@@ -107,17 +115,14 @@ export function DashboardPage() {
         </Box>
         <Box className="metric">
           <Text color="gray.600" fontSize="sm">
-            任务完成度
+            限制暂缓任务
           </Text>
           <Heading mt="2" mb="1" size="lg">
-            {completedTasks} / {totalTasks}
+            {suspendedTasks}
           </Heading>
-          <Progress
-            mt="2"
-            size="sm"
-            value={totalTasks ? (completedTasks / totalTasks) * 100 : 0}
-            colorScheme="brand"
-          />
+          <Text color="gray.500" fontSize="xs">
+            {activeRestrictions} 项生效中的限制处理请求，解除后按原顺序恢复
+          </Text>
         </Box>
       </Box>
 
@@ -178,6 +183,21 @@ export function DashboardPage() {
             <Badge colorScheme="brand">{data.systems.length} 个系统</Badge>
           </Flex>
           <VStack align="stretch" spacing="4">
+            <Box>
+              <Flex justify="space-between" mb="1">
+                <Text fontWeight="600" fontSize="sm">
+                  任务完成度
+                </Text>
+                <Text color="gray.500" fontSize="sm">
+                  {completedTasks} / {totalTasks}
+                </Text>
+              </Flex>
+              <Progress
+                size="sm"
+                value={totalTasks ? (completedTasks / totalTasks) * 100 : 0}
+                colorScheme="brand"
+              />
+            </Box>
             <Flex gap="12px" align="flex-start">
               <ShieldCheck size={20} color="#237b78" />
               <Box>

@@ -2,8 +2,10 @@ import { Badge, type BadgeProps } from '@chakra-ui/react'
 import {
   requestStatusLabels,
   requestTypeLabels,
+  taskStatusLabels,
   type RequestStatus,
   type RequestType,
+  type TaskStatus,
 } from '@/lib/schemas'
 
 const statusColor: Record<RequestStatus, string> = {
@@ -25,6 +27,14 @@ const typeColor: Record<RequestType, string> = {
   restriction: 'purple',
 }
 
+const taskStatusColor: Record<TaskStatus, string> = {
+  pending: 'gray',
+  active: 'blue',
+  completed: 'green',
+  blocked: 'red',
+  suspended: 'purple',
+}
+
 export function StatusBadge({ status }: { status: RequestStatus }) {
   return <Badge colorScheme={statusColor[status]}>{requestStatusLabels[status]}</Badge>
 }
@@ -34,5 +44,11 @@ export function TypeBadge({ type, ...props }: { type: RequestType } & BadgeProps
     <Badge colorScheme={typeColor[type]} {...props}>
       {requestTypeLabels[type]}
     </Badge>
+  )
+}
+
+export function TaskStatusBadge({ status }: { status: TaskStatus }) {
+  return (
+    <Badge colorScheme={taskStatusColor[status]}>{taskStatusLabels[status]}</Badge>
   )
 }

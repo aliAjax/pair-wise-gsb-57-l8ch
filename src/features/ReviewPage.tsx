@@ -39,11 +39,13 @@ import { PageHeader } from '@/components/PageHeader'
 import { StatusBadge } from '@/components/StatusBadge'
 import {
   useExtendRequestMutation,
+  useLiftRestrictionMutation,
   useResolveConflictMutation,
   useVerifyIdentityMutation,
   useWorkspaceQuery,
 } from '@/lib/hooks'
 import { deadlineState } from '@/services/workflow'
+import { PauseCircle } from 'lucide-react'
 
 export function ReviewPage() {
   const router = useRouter()
@@ -53,10 +55,11 @@ export function ReviewPage() {
   const verifyIdentity = useVerifyIdentityMutation()
   const resolveConflict = useResolveConflictMutation()
   const extendRequest = useExtendRequestMutation()
+  const liftRestriction = useLiftRestrictionMutation()
   const [selectedId, setSelectedId] = useState('')
-  const [action, setAction] = useState<'identity-pass' | 'identity-return' | 'resolve' | 'extend'>(
-    'identity-pass',
-  )
+  const [action, setAction] = useState<
+    'identity-pass' | 'identity-return' | 'resolve' | 'extend' | 'lift'
+  >('identity-pass')
   const [conflictIndex, setConflictIndex] = useState(0)
   const [content, setContent] = useState('')
   const [days, setDays] = useState(15)
@@ -69,6 +72,8 @@ export function ReviewPage() {
           request.identity.status === 'insufficient' ||
           request.duplicateOf ||
           request.conflicts.length > 0 ||
+          request.tasks.some((task) => task.heldByRequestId) ||
+          (request.type === 'restriction' && request.restriction?.status === 'active') ||
           new Date(request.dueAt).getTime() < Date.now(),
       ) ?? [],
     [data],
@@ -80,7 +85,7 @@ export function ReviewPage() {
 
   function openAction(
     requestId: string,
-    nextAction: 'identity-pass' | 'identity-return' | 'resolve' | 'extend',
+    nextAction: 'identity-pass' | 'identity-return' | 'resolve' | 'extend' | 'lift',
     index = 0,
   ) {
     setSelectedId(requestId)
@@ -112,6 +117,12 @@ export function ReviewPage() {
           requestId: selected.id,
           conflictIndex,
           resolution: content,
+          operator: '隐私负责人',
+        })
+      } else if (action === 'lift') {
+        await liftRestriction.mutateAsync({
+          requestId: selected.id,
+          reason: content,
           operator: '隐私负责人',
         })
       } else {
@@ -171,10 +182,14 @@ export function ReviewPage() {
         </Box>
         <Box className="metric info">
           <Text color="gray.600" fontSize="sm">
-            疑似重复
+            限制暂缓任务
           </Text>
           <Heading mt="2" size="md">
-            {queue.filter((request) => request.duplicateOf).length}
+            {queue.reduce(
+              (total, request) =>
+                total + request.tasks.filter((task) => task.heldByRequestId).length,
+              0,
+            )}
           </Heading>
         </Box>
       </SimpleGrid>
@@ -211,6 +226,16 @@ export function ReviewPage() {
                         {request.duplicateOf ? (
                           <Badge colorScheme="orange">疑似重复 {request.duplicateOf}</Badge>
                         ) : null}
+                        {request.tasks
+                          .filter((task) => task.heldByRequestId)
+                          .map((task) => (
+                            <HStack key={task.id} spacing="1">
+                              <PauseCircle size={13} color="#805AD5" />
+                              <Text color="purple.700" fontSize="sm">
+                                「{task.name}」暂缓 · 依据限制处理请求 {task.heldByRequestCode}
+                              </Text>
+                            </HStack>
+                          ))}
                         {request.conflicts.map((conflict, index) => (
                           <Text key={`${conflict}-${index}`} fontSize="sm">
                             {conflict}
@@ -263,6 +288,17 @@ export function ReviewPage() {
                             处理冲突
                           </Button>
                         ) : null}
+                        {request.type === 'restriction' &&
+                        request.restriction?.status === 'active' ? (
+                          <Button
+                            size="xs"
+                            variant="link"
+                            colorScheme="purple"
+                            onClick={() => openAction(request.id, 'lift')}
+                          >
+                            解除限制
+                          </Button>
+                        ) : null}
                         <Button
                           size="xs"
                           variant="link"
@@ -293,6 +329,11 @@ export function ReviewPage() {
                   {selected.conflicts[conflictIndex]}
                 </Alert>
               ) : null}
+              {action === 'lift' ? (
+                <Alert status="warning" borderRadius="5px">
+                  解除后被暂缓的清除/更正任务按原登记顺序重新下发；已成功回执的项不重发、不覆盖。
+                </Alert>
+              ) : null}
               {action === 'extend' ? (
                 <FormControl isRequired>
                   <FormLabel>延期天数</FormLabel>
@@ -307,7 +348,13 @@ export function ReviewPage() {
               ) : null}
               <FormControl isRequired>
                 <FormLabel>
-                  {action === 'resolve' ? '复核结论' : action === 'extend' ? '延期原因' : '核验说明'}
+                  {action === 'resolve'
+                    ? '复核结论'
+                    : action === 'extend'
+                      ? '延期原因'
+                      : action === 'lift'
+                        ? '解除限制原因'
+                        : '核验说明'}
                 </FormLabel>
                 <Textarea
                   value={content}

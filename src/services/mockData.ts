@@ -1,5 +1,10 @@
-import type { DataSystem, PrivacyRequest, WorkspaceState } from '@/types/domain'
+import type {
+  DataSystem,
+  PrivacyRequest,
+  WorkspaceState,
+} from '@/types/domain'
 import { addDays, buildWorkflowSteps } from './workflow'
+import { synchronizeScheduling } from './scheduler'
 
 const systems: DataSystem[] = [
   {
@@ -80,11 +85,19 @@ export function createInitialState(): WorkspaceState {
   const request3At = '2026-09-21T03:10:00.000Z'
   const request4At = '2026-09-24T05:40:00.000Z'
   const request5At = '2026-09-05T01:00:00.000Z'
+  const request6At = '2026-09-29T08:00:00.000Z'
+  const request7At = '2026-10-01T09:30:00.000Z'
   const request1Due = addDays(new Date(request1At), 30).toISOString()
   const request2Due = addDays(new Date(request2At), 30).toISOString()
   const request3Due = addDays(new Date(request3At), 45).toISOString()
   const request4Due = addDays(new Date(request4At), 30).toISOString()
   const request5Due = addDays(new Date(request5At), 30).toISOString()
+  const request6Due = addDays(new Date(request6At), 30).toISOString()
+  const request7Due = addDays(new Date(request7At), 45).toISOString()
+
+  // 限制处理：2026-10-01 核验通过并生效，30 天后到期。
+  const restrictionEffectiveAt = '2026-10-01T02:00:00.000Z'
+  const restrictionExpiresAt = addDays(new Date(restrictionEffectiveAt), 30).toISOString()
 
   const requests: PrivacyRequest[] = [
     {
@@ -338,9 +351,104 @@ export function createInitialState(): WorkspaceState {
         ),
       ],
     },
+    {
+      // 生效中的限制处理请求：同一数据主体刘晓的清除/更正任务被暂缓。
+      id: 'req-006',
+      code: 'DSR-2026-006',
+      requesterName: '刘晓',
+      requesterContact: 'li***@example.com',
+      region: 'eu',
+      type: 'restriction',
+      status: 'processing',
+      identity: {
+        status: 'verified',
+        materialType: 'masked-id',
+        maskedReference: '320***********5521',
+        protectedDigest: 'ID-2C8E',
+        note: '限制处理申请材料已核验，限制自核验通过时生效 30 天。',
+        reviewedAt: restrictionEffectiveAt,
+      },
+      requestedAt: request6At,
+      dueAt: request6Due,
+      extendedDays: 0,
+      affectedSystemIds: ['sys-crm', 'sys-support'],
+      tasks: buildWorkflowSteps({
+        requestId: 'req-006',
+        type: 'restriction',
+        systemIds: ['sys-crm', 'sys-support'],
+        requestedAt: request6At,
+        dueAt: request6Due,
+        initialStatus: 'processing',
+        systems,
+      }),
+      evidence: [],
+      conflicts: [],
+      resultSummary: '',
+      closureReason: '',
+      restriction: {
+        status: 'active',
+        effectiveAt: restrictionEffectiveAt,
+        expiresAt: restrictionExpiresAt,
+        durationDays: 30,
+        suspendedTaskRefs: [],
+      },
+      audit: [
+        audit(
+          'req-audit-006',
+          '限制处理生效',
+          '隐私负责人',
+          `限制处理自 ${restrictionEffectiveAt} 起生效，至 ${restrictionExpiresAt} 到期。`,
+          restrictionEffectiveAt,
+        ),
+      ],
+    },
+    {
+      // 更正请求：登记于限制生效之后，系统任务在排程同步时被暂缓，停在待复核。
+      id: 'req-007',
+      code: 'DSR-2026-007',
+      requesterName: '刘晓',
+      requesterContact: 'li***@example.com',
+      region: 'eu',
+      type: 'rectification',
+      status: 'processing',
+      identity: {
+        status: 'verified',
+        materialType: 'account-ownership',
+        maskedReference: '账号所有权验证通过',
+        protectedDigest: 'ACC-7741',
+        note: '已通过账号双因素与近期交易核验。',
+        reviewedAt: '2026-10-01T10:00:00.000Z',
+      },
+      requestedAt: request7At,
+      dueAt: request7Due,
+      extendedDays: 0,
+      affectedSystemIds: ['sys-support', 'sys-archive'],
+      tasks: buildWorkflowSteps({
+        requestId: 'req-007',
+        type: 'rectification',
+        systemIds: ['sys-support', 'sys-archive'],
+        requestedAt: request7At,
+        dueAt: request7Due,
+        initialStatus: 'processing',
+        systems,
+      }),
+      evidence: [],
+      conflicts: [],
+      resultSummary: '',
+      closureReason: '',
+      audit: [
+        audit(
+          'req-audit-007',
+          '登记更正请求',
+          '客服专员',
+          '更正请求已登记并通过身份核验，等待系统任务排程。',
+          request7At,
+        ),
+      ],
+    },
   ]
 
-  return {
+  const state: WorkspaceState = {
     requests,
     systems,
     comments: [
@@ -357,6 +465,62 @@ export function createInitialState(): WorkspaceState {
         author: '隐私运营',
         content: '请先确认该请求与 DSR-2026-005 是否属于重复申请。',
         createdAt: '2026-09-19T02:05:00.000Z',
+      },
+      {
+        id: 'comment-003',
+        requestId: 'req-006',
+        author: '隐私负责人',
+        content: '限制生效期间，同一数据主体的清除和更正一律暂缓，到期或撤回后按原顺序恢复。',
+        createdAt: '2026-10-01T02:10:00.000Z',
+      },
+    ],
+    // 对账批次：客户系统项已送达回执；档案库维护中，项未送达，等待按检查点补送。
+    dispatchBatches: [
+      {
+        id: 'batch-demo-001',
+        code: 'BATCH-2026-001',
+        createdAt: '2026-10-02T03:00:00.000Z',
+        createdBy: '隐私运营',
+        status: 'open',
+        checkpointUpdatedAt: '2026-10-02T03:00:00.000Z',
+        items: [
+          {
+            id: 'dispatch-item-demo-1',
+            requestId: 'req-001',
+            requestCode: 'DSR-2026-001',
+            taskId: 'req-001-locate-sys-crm',
+            taskName: '定位 客户关系管理系统 数据',
+            systemId: 'sys-crm',
+            systemName: '客户关系管理系统',
+            subjectContact: 'zh***@example.com',
+            status: 'delivered',
+            registeredSequence: 0,
+            attempts: 1,
+            lastAttemptAt: '2026-10-02T03:00:00.000Z',
+            deliveredAt: '2026-10-02T03:00:00.000Z',
+            receiptReference: 'RC-7741AB20',
+          },
+          {
+            id: 'dispatch-item-demo-2',
+            requestId: 'req-001',
+            requestCode: 'DSR-2026-001',
+            taskId: 'req-001-locate-sys-order',
+            taskName: '定位 订单与交易平台 数据',
+            systemId: 'sys-order',
+            systemName: '订单与交易平台',
+            subjectContact: 'zh***@example.com',
+            status: 'pending',
+            registeredSequence: 0,
+            attempts: 0,
+          },
+        ],
+        audit: [
+          {
+            at: '2026-10-02T03:00:00.000Z',
+            operator: '隐私运营',
+            detail: '批次建立：客户关系管理系统项已送达并回执，订单平台项待前置完成后补送。',
+          },
+        ],
       },
     ],
     audit: [
@@ -384,9 +548,22 @@ export function createInitialState(): WorkspaceState {
         detail: '风控平台与客户系统结果不一致，进入复核队列。',
         createdAt: '2026-09-28T08:30:00.000Z',
       },
+      {
+        id: 'audit-global-4',
+        requestId: 'req-006',
+        action: '限制处理生效',
+        operator: '隐私负责人',
+        detail: '同一数据主体刘晓的清除和更正任务暂缓，不向数据系统下发。',
+        createdAt: restrictionEffectiveAt,
+      },
     ],
     revision: 1,
   }
+
+  // 排程同步（静默，演示数据的历史状态不补写审计）：登记顺序、限制暂缓、批次检查点对齐。
+  synchronizeScheduling(state, { silent: true, at: new Date('2026-10-04T08:00:00.000Z') })
+  // 同步会因限制把 req-007 置为 review-required，符合“停在待复核”。
+  return state
 }
 
 export const requestTypeOptions = [
