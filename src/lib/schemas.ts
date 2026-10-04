@@ -30,17 +30,25 @@ export const identitySchema = z.object({
   reviewedAt: z.string().optional(),
 })
 
+export const taskHoldSchema = z.object({
+  restrictionRequestId: z.string(),
+  restrictionCode: z.string(),
+  heldAt: z.string(),
+  reason: z.string(),
+})
+
 export const workflowStepSchema = z.object({
   id: z.string(),
   order: z.number(),
   name: z.string(),
   role: z.string(),
   systemId: z.string().optional(),
-  status: z.enum(['pending', 'active', 'completed', 'blocked']),
+  status: z.enum(['pending', 'active', 'completed', 'blocked', 'held']),
   assignee: z.string(),
   dueAt: z.string(),
   completedAt: z.string().optional(),
   exceptionReason: z.string(),
+  hold: taskHoldSchema.optional(),
 })
 
 export const evidenceSchema = z.object({
@@ -106,11 +114,38 @@ export const privacyRequestSchema = z.object({
   ),
 })
 
+export const dispatchItemSchema = z.object({
+  id: z.string(),
+  requestId: z.string(),
+  requestCode: z.string(),
+  taskId: z.string(),
+  taskName: z.string(),
+  systemId: z.string(),
+  systemName: z.string(),
+  status: z.enum(['queued', 'delivered', 'acknowledged', 'failed']),
+  attempts: z.number().int().nonnegative(),
+  registeredAt: z.string(),
+  deliveredAt: z.string().optional(),
+  acknowledgedAt: z.string().optional(),
+  failureReason: z.string(),
+})
+
+export const dispatchBatchSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  createdAt: z.string(),
+  status: z.enum(['open', 'checkpointed', 'settled']),
+  checkpointNote: z.string(),
+  checkpointAt: z.string().optional(),
+  items: z.array(dispatchItemSchema),
+})
+
 export const workspaceStateSchema = z.object({
   requests: z.array(privacyRequestSchema),
   systems: z.array(dataSystemSchema),
   comments: z.array(commentSchema),
   audit: z.array(auditEntrySchema),
+  batches: z.array(dispatchBatchSchema).default([]),
   revision: z.number(),
 })
 
@@ -215,15 +250,36 @@ export const recordExportInputSchema = z.object({
   operator: z.string(),
 })
 
+export const liftRestrictionInputSchema = z.object({
+  state: workspaceStateSchema,
+  requestId: z.string(),
+  note: z.string().min(2),
+  operator: z.string(),
+})
+
+export const retryBatchInputSchema = z.object({
+  state: workspaceStateSchema,
+  batchId: z.string(),
+  operator: z.string(),
+})
+
+export const syncScheduleInputSchema = z.object({
+  state: workspaceStateSchema,
+  operator: z.string().default('系统调度'),
+})
+
 export type RequestType = z.infer<typeof requestTypeSchema>
 export type RequestStatus = z.infer<typeof requestStatusSchema>
 export type Region = z.infer<typeof regionSchema>
 export type IdentityCheck = z.infer<typeof identitySchema>
+export type TaskHold = z.infer<typeof taskHoldSchema>
 export type WorkflowStep = z.infer<typeof workflowStepSchema>
 export type ExecutionEvidence = z.infer<typeof evidenceSchema>
 export type ReviewComment = z.infer<typeof commentSchema>
 export type AuditEntry = z.infer<typeof auditEntrySchema>
 export type DataSystem = z.infer<typeof dataSystemSchema>
+export type DispatchItem = z.infer<typeof dispatchItemSchema>
+export type DispatchBatch = z.infer<typeof dispatchBatchSchema>
 export type PrivacyRequest = z.infer<typeof privacyRequestSchema>
 export type WorkspaceState = z.infer<typeof workspaceStateSchema>
 
@@ -257,4 +313,25 @@ export const systemStatusLabels: Record<DataSystem['status'], string> = {
   active: '在用',
   maintenance: '维护中',
   retired: '已退役',
+}
+
+export const taskStatusLabels: Record<WorkflowStep['status'], string> = {
+  pending: '未开始',
+  active: '执行中',
+  completed: '已完成',
+  blocked: '已阻断',
+  held: '待复核暂缓',
+}
+
+export const dispatchStatusLabels: Record<DispatchItem['status'], string> = {
+  queued: '待发送',
+  delivered: '已送达',
+  acknowledged: '已回执',
+  failed: '发送失败',
+}
+
+export const batchStatusLabels: Record<DispatchBatch['status'], string> = {
+  open: '开放中',
+  checkpointed: '检查点保留',
+  settled: '已结清',
 }

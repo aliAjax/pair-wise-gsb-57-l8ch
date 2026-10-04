@@ -33,17 +33,34 @@ export function useWorkspaceQuery() {
   return query
 }
 
+// 变更操作串行执行：同时提交解除限制与执行动作时，后到动作读取前一动作
+// 写入的最新工作区状态，不会基于过期快照覆盖已回执或已暂缓的项。
+let mutationQueue: Promise<unknown> = Promise.resolve()
+
+function enqueueMutation<T>(task: () => Promise<T>): Promise<T> {
+  const run = mutationQueue.then(task, task)
+  mutationQueue = run.then(
+    () => undefined,
+    () => undefined,
+  )
+  return run
+}
+
 function useWorkspaceMutation<TInput>(
   perform: (input: TInput, state: WorkspaceState) => Promise<WorkspaceState>,
 ): UseMutationResult<WorkspaceState, Error, TInput> {
   const queryClient = useQueryClient()
   return useMutation({
-    mutationFn: async (input: TInput) => {
-      const state =
-        queryClient.getQueryData<WorkspaceState>(workspaceQueryKey) ?? loadWorkspace()
-      if (!state) throw new Error('本地工作区尚未加载')
-      return perform(input, state)
-    },
+    mutationFn: async (input: TInput) =>
+      enqueueMutation(async () => {
+        const state =
+          queryClient.getQueryData<WorkspaceState>(workspaceQueryKey) ?? loadWorkspace()
+        if (!state) throw new Error('本地工作区尚未加载')
+        const next = await perform(input, state)
+        saveWorkspace(next)
+        queryClient.setQueryData(workspaceQueryKey, next)
+        return next
+      }),
     onSuccess: (state) => {
       saveWorkspace(state)
       queryClient.setQueryData(workspaceQueryKey, state)
@@ -132,6 +149,27 @@ export function useRecordExportMutation() {
   return useWorkspaceMutation(
     (input: Omit<Parameters<typeof trpc.request.recordExport.mutate>[0], 'state'>, state) =>
       trpc.request.recordExport.mutate({ ...input, state }),
+  )
+}
+
+export function useLiftRestrictionMutation() {
+  return useWorkspaceMutation(
+    (input: Omit<Parameters<typeof trpc.request.liftRestriction.mutate>[0], 'state'>, state) =>
+      trpc.request.liftRestriction.mutate({ ...input, state }),
+  )
+}
+
+export function useRetryBatchMutation() {
+  return useWorkspaceMutation(
+    (input: Omit<Parameters<typeof trpc.schedule.retryBatch.mutate>[0], 'state'>, state) =>
+      trpc.schedule.retryBatch.mutate({ ...input, state }),
+  )
+}
+
+export function useSyncScheduleMutation() {
+  return useWorkspaceMutation(
+    (input: Omit<Parameters<typeof trpc.schedule.sync.mutate>[0], 'state'>, state) =>
+      trpc.schedule.sync.mutate({ ...input, state }),
   )
 }
 

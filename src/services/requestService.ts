@@ -1,8 +1,11 @@
 import type {
+  DispatchBatch,
+  DispatchItem,
   IdentityCheck,
   PrivacyRequest,
   RequestStatus,
   RequestType,
+  WorkflowStep,
   WorkspaceState,
 } from '@/types/domain'
 import { addDays, buildWorkflowSteps, responseDays } from './workflow'
@@ -10,6 +13,9 @@ import { addDays, buildWorkflowSteps, responseDays } from './workflow'
 const cloneState = (state: WorkspaceState): WorkspaceState => structuredClone(state)
 const now = () => new Date().toISOString()
 const id = (prefix: string) => `${prefix}-${crypto.randomUUID()}`
+
+/** 限制处理生效期间，以下请求类型的系统任务必须停在待复核，不下发数据系统。 */
+const RESTRICTED_TYPES: RequestType[] = ['deletion', 'rectification']
 
 function digest(value: string): string {
   let hash = 2166136261
@@ -45,6 +51,214 @@ function appendAudit(
   })
 }
 
+// ---------------------------------------------------------------------------
+// 排程引擎：限制处理请求、系统任务与对账批次共同决定任务是否下发数据系统。
+// ---------------------------------------------------------------------------
+
+/** 生效中的限制处理请求：未关闭、未拒绝且未到期。 */
+export function activeRestrictionFor(
+  state: WorkspaceState,
+  requesterContact: string,
+  excludeRequestId?: string,
+  at: Date = new Date(),
+): PrivacyRequest | undefined {
+  return state.requests.find(
+    (request) =>
+      request.type === 'restriction' &&
+      request.requesterContact === requesterContact &&
+      request.id !== excludeRequestId &&
+      !['completed', 'rejected'].includes(request.status) &&
+      new Date(request.dueAt).getTime() >= at.getTime(),
+  )
+}
+
+function holdTask(
+  draft: WorkspaceState,
+  request: PrivacyRequest,
+  task: WorkflowStep,
+  restriction: PrivacyRequest,
+  logAudit = true,
+) {
+  task.status = 'held'
+  task.hold = {
+    restrictionRequestId: restriction.id,
+    restrictionCode: restriction.code,
+    heldAt: now(),
+    reason: `依据限制处理请求 ${restriction.code} 暂缓，未下发数据系统。`,
+  }
+  task.exceptionReason = ''
+  if (logAudit) {
+    appendAudit(
+      draft,
+      request,
+      '任务暂缓下发',
+      '系统调度',
+      `任务「${task.name}」依据限制处理请求 ${restriction.code} 停在待复核，未下发数据系统。`,
+    )
+  }
+}
+
+function findDispatchItem(draft: WorkspaceState, taskId: string) {
+  for (const batch of draft.batches) {
+    const item = batch.items.find((entry) => entry.taskId === taskId)
+    if (item) return { batch, item }
+  }
+  return undefined
+}
+
+function ensureOpenBatch(draft: WorkspaceState): DispatchBatch {
+  const latest = draft.batches[0]
+  if (latest && latest.status === 'open') return latest
+  const batch: DispatchBatch = {
+    id: id('batch'),
+    label: `BATCH-2026-${String(draft.batches.length + 1).padStart(3, '0')}`,
+    createdAt: now(),
+    status: 'open',
+    checkpointNote: '',
+    items: [],
+  }
+  draft.batches.unshift(batch)
+  return batch
+}
+
+/** 登记下发项；已送达或已回执的项复用原记录，绝不重复登记。 */
+function queueDispatch(
+  draft: WorkspaceState,
+  request: PrivacyRequest,
+  task: WorkflowStep,
+): DispatchItem | undefined {
+  if (!task.systemId) return undefined
+  const existing = findDispatchItem(draft, task.id)
+  if (existing) return existing.item
+  const system = draft.systems.find((item) => item.id === task.systemId)
+  const batch = ensureOpenBatch(draft)
+  const item: DispatchItem = {
+    id: id('dispatch'),
+    requestId: request.id,
+    requestCode: request.code,
+    taskId: task.id,
+    taskName: task.name,
+    systemId: task.systemId,
+    systemName: system?.name ?? task.systemId,
+    status: 'queued',
+    attempts: 0,
+    registeredAt: now(),
+    failureReason: '',
+  }
+  batch.items.push(item)
+  return item
+}
+
+/** 尝试送达单个下发项；系统维护或接口异常时保留批次检查点。 */
+function attemptDelivery(draft: WorkspaceState, batch: DispatchBatch, item: DispatchItem) {
+  if (item.status === 'delivered' || item.status === 'acknowledged') return
+  const system = draft.systems.find((entry) => entry.id === item.systemId)
+  item.attempts += 1
+  if (!system || system.status !== 'active') {
+    item.status = 'failed'
+    item.failureReason = system ? `${system.name} 维护中，接口暂停下发` : '目标系统不存在或已退役'
+    batch.status = 'checkpointed'
+    batch.checkpointAt = now()
+    batch.checkpointNote = `批次在「${item.systemName}」遇到${system ? '系统维护' : '接口异常'}，已保留检查点；重试仅补未送达项，已成功回执不重发。`
+    return
+  }
+  item.status = 'delivered'
+  item.deliveredAt = now()
+  item.failureReason = ''
+  const request = draft.requests.find((entry) => entry.id === item.requestId)
+  const task = request?.tasks.find((entry) => entry.id === item.taskId)
+  if (task?.status === 'completed') {
+    item.status = 'acknowledged'
+    item.acknowledgedAt = now()
+  }
+}
+
+function refreshBatchStatus(batch: DispatchBatch) {
+  if (batch.items.length && batch.items.every((item) => item.status === 'acknowledged')) {
+    batch.status = 'settled'
+  } else if (batch.items.some((item) => item.status === 'failed')) {
+    batch.status = 'checkpointed'
+  } else {
+    batch.status = 'open'
+  }
+}
+
+/** 顺序激活：排在前面的任务仍被暂缓时，后续任务不提前激活。 */
+function nextActivatableTask(request: PrivacyRequest) {
+  return request.tasks.find(
+    (task) =>
+      task.status === 'pending' &&
+      !request.tasks.some((other) => other.order < task.order && other.status === 'held'),
+  )
+}
+
+function activateNextPending(request: PrivacyRequest) {
+  if (request.identity.status !== 'verified') return
+  if (request.tasks.some((task) => task.status === 'active')) return
+  const next = nextActivatableTask(request)
+  if (next) next.status = 'active'
+}
+
+/**
+ * 重算排程：限制期内的清除/更正系统任务停在待复核；限制解除或到期后，
+ * 等待任务按原登记顺序（请求登记时间 + 任务序号）重新下发。
+ * 已完成、已阻断和已回执的项一律不覆盖。
+ */
+export function reconcileSchedule(draft: WorkspaceState): boolean {
+  let changed = false
+  const at = new Date()
+  const released: Array<{ request: PrivacyRequest; task: WorkflowStep }> = []
+
+  for (const request of draft.requests) {
+    if (!RESTRICTED_TYPES.includes(request.type)) continue
+    if (['completed', 'rejected'].includes(request.status)) continue
+    const restriction = activeRestrictionFor(draft, request.requesterContact, request.id, at)
+    for (const task of request.tasks) {
+      if (!task.systemId) continue
+      if (task.status === 'completed' || task.status === 'blocked') continue
+      if (restriction) {
+        if (task.status !== 'held') {
+          holdTask(draft, request, task, restriction)
+          changed = true
+        }
+      } else if (task.status === 'held') {
+        task.status = 'pending'
+        task.hold = undefined
+        released.push({ request, task })
+        changed = true
+      }
+    }
+  }
+
+  released.sort(
+    (left, right) =>
+      left.request.requestedAt.localeCompare(right.request.requestedAt) ||
+      left.task.order - right.task.order,
+  )
+  for (const { request, task } of released) {
+    appendAudit(
+      draft,
+      request,
+      '暂缓任务恢复排程',
+      '系统调度',
+      `限制已解除或到期，任务「${task.name}」按原登记顺序重新下发。`,
+    )
+    if (request.identity.status !== 'verified') continue
+    const item = queueDispatch(draft, request, task)
+    if (item) {
+      const batch = draft.batches.find((entry) => entry.items.some((entry2) => entry2.id === item.id))
+      if (batch) attemptDelivery(draft, batch, item)
+    }
+  }
+  for (const batch of draft.batches) refreshBatchStatus(batch)
+
+  const affected = new Set(released.map((entry) => entry.request.id))
+  for (const request of draft.requests) {
+    if (affected.has(request.id)) activateNextPending(request)
+  }
+  return changed
+}
+
 function mutateRequest(
   state: WorkspaceState,
   requestId: string,
@@ -52,9 +266,13 @@ function mutateRequest(
   audit: { action: string; operator: string; detail: string },
 ): WorkspaceState {
   const draft = cloneState(state)
+  // 每次变更前先按最新限制处理状态重算排程，后到动作始终基于新状态执行。
+  reconcileSchedule(draft)
   const request = draft.requests.find((item) => item.id === requestId)
   if (!request) throw new Error('请求不存在')
   mutation(request, draft)
+  // 变更可能关闭限制请求或改动主体信息，再次重算让暂缓/恢复立即生效。
+  reconcileSchedule(draft)
   appendAudit(draft, request, audit.action, audit.operator, audit.detail)
   draft.revision += 1
   return draft
@@ -141,6 +359,8 @@ export function createRequest(
     request.conflicts.push(`疑似重复请求：与 ${duplicate.code} 的请求人和请求类型相同。`)
   }
   draft.requests.unshift(request)
+  // 新登记的清除/更正请求若处于同主体限制期内，系统任务立即停在待复核。
+  reconcileSchedule(draft)
   appendAudit(
     draft,
     request,
@@ -193,7 +413,7 @@ export function verifyIdentity(
         request.conflicts = request.conflicts.filter(
           (conflict) => !conflict.startsWith('身份材料不足'),
         )
-        const nextTask = request.tasks.find((task) => task.status === 'pending')
+        const nextTask = nextActivatableTask(request)
         if (nextTask) nextTask.status = 'active'
         request.status = request.conflicts.length ? 'review-required' : 'processing'
       } else {
@@ -242,23 +462,67 @@ export function taskAction(
   note: string,
   operator: string,
 ): WorkspaceState {
+  const audit = {
+    action:
+      action === 'start' ? '开始履约任务' : action === 'complete' ? '完成履约任务' : '阻断履约任务',
+    operator,
+    detail: note || `${taskId} 状态更新为 ${action}。`,
+  }
   return mutateRequest(
     state,
     requestId,
-    (request) => {
+    (request, draft) => {
       if (request.identity.status !== 'verified') {
         throw new Error('身份未核验通过，不能推进履约任务')
       }
       const task = request.tasks.find((item) => item.id === taskId)
       if (!task) throw new Error('任务不存在')
+      if (task.status === 'held') {
+        // 不抛错而返回重算后的状态：让后到动作拿到已暂缓的最新排程。
+        audit.action = '任务暂缓下发'
+        audit.detail = `任务「${task.name}」${task.hold?.reason ?? '存在生效中的限制处理请求'}不能下发数据系统。`
+        return
+      }
+      if (task.status === 'completed') {
+        throw new Error('任务已完成并取得回执，不能重复执行或覆盖。')
+      }
       if (action === 'start') {
+        // 派发前再次评估限制处理状态，不符合条件的任务停在待复核。
+        const restriction =
+          RESTRICTED_TYPES.includes(request.type) && task.systemId
+            ? activeRestrictionFor(draft, request.requesterContact, request.id)
+            : undefined
+        if (restriction) {
+          holdTask(draft, request, task, restriction, false)
+          audit.action = '任务暂缓下发'
+          audit.detail = `任务「${task.name}」依据限制处理请求 ${restriction.code} 停在待复核，未下发数据系统。`
+          return
+        }
         task.status = 'active'
         task.exceptionReason = ''
+        if (task.systemId) {
+          const item = queueDispatch(draft, request, task)
+          if (item) {
+            const batch = draft.batches.find((entry) =>
+              entry.items.some((entry2) => entry2.id === item.id),
+            )
+            if (batch) {
+              attemptDelivery(draft, batch, item)
+              refreshBatchStatus(batch)
+            }
+          }
+        }
       } else if (action === 'complete') {
         task.status = 'completed'
         task.completedAt = now()
         task.exceptionReason = ''
-        const nextTask = request.tasks.find((item) => item.status === 'pending')
+        const dispatched = findDispatchItem(draft, task.id)
+        if (dispatched && dispatched.item.status === 'delivered') {
+          dispatched.item.status = 'acknowledged'
+          dispatched.item.acknowledgedAt = now()
+          refreshBatchStatus(dispatched.batch)
+        }
+        const nextTask = nextActivatableTask(request)
         if (nextTask) nextTask.status = 'active'
       } else {
         task.status = 'blocked'
@@ -273,12 +537,7 @@ export function taskAction(
         request.status = 'processing'
       }
     },
-    {
-      action:
-        action === 'start' ? '开始履约任务' : action === 'complete' ? '完成履约任务' : '阻断履约任务',
-      operator,
-      detail: note || `${taskId} 状态更新为 ${action}。`,
-    },
+    audit,
   )
 }
 
@@ -415,6 +674,98 @@ export function closeRequest(
       detail: closureReason ? `提前关闭理由：${closureReason}` : '截止时间后完成关闭。',
     },
   )
+}
+
+export function liftRestriction(
+  state: WorkspaceState,
+  requestId: string,
+  note: string,
+  operator: string,
+): WorkspaceState {
+  return mutateRequest(
+    state,
+    requestId,
+    (request, draft) => {
+      if (request.type !== 'restriction') {
+        throw new Error('仅限制处理请求支持解除操作')
+      }
+      if (['completed', 'rejected'].includes(request.status)) {
+        throw new Error('限制处理请求已关闭，不能重复解除')
+      }
+      request.status = 'completed'
+      request.resultSummary = note
+      request.closureReason = note
+      for (const task of request.tasks) {
+        if (task.status !== 'completed') {
+          task.status = 'completed'
+          task.completedAt = now()
+        }
+      }
+      // 限制解除后，同主体暂缓任务按原登记顺序重新下发。
+      reconcileSchedule(draft)
+    },
+    {
+      action: '解除限制处理',
+      operator,
+      detail: `${note}（同主体暂缓任务按原登记顺序恢复下发）`,
+    },
+  )
+}
+
+export function retryBatch(
+  state: WorkspaceState,
+  batchId: string,
+  operator: string,
+): WorkspaceState {
+  const draft = cloneState(state)
+  // 重试前先对齐限制处理状态，限制期内的项保持暂缓，不补发。
+  reconcileSchedule(draft)
+  const batch = draft.batches.find((item) => item.id === batchId)
+  if (!batch) throw new Error('对账批次不存在')
+  const pendingItems = batch.items.filter(
+    (item) => item.status === 'failed' || item.status === 'queued',
+  )
+  if (!pendingItems.length) {
+    throw new Error('批次没有待补发项，已回执项不会重发')
+  }
+  let retried = 0
+  let heldBack = 0
+  for (const item of pendingItems) {
+    const request = draft.requests.find((entry) => entry.id === item.requestId)
+    const task = request?.tasks.find((entry) => entry.id === item.taskId)
+    if (task?.status === 'held') {
+      heldBack += 1
+      continue
+    }
+    attemptDelivery(draft, batch, item)
+    retried += 1
+  }
+  refreshBatchStatus(batch)
+  draft.audit.unshift({
+    id: id('audit'),
+    action: '重试对账批次',
+    operator,
+    detail: `批次 ${batch.label} 依据检查点补发 ${retried} 项未送达任务，${heldBack} 项因限制处理继续暂缓，已成功回执项不重发。`,
+    createdAt: now(),
+  })
+  draft.revision += 1
+  return draft
+}
+
+export function syncSchedule(state: WorkspaceState, operator: string): WorkspaceState {
+  const draft = cloneState(state)
+  const changed = reconcileSchedule(draft)
+  draft.audit.unshift({
+    id: id('audit'),
+    action: '重算排程',
+    operator,
+    detail: changed
+      ? '已按限制处理请求、系统任务和对账批次重算排程，暂缓与恢复动作均已记录。'
+      : '排程已是最新，无待调整项。',
+    createdAt: now(),
+  })
+  draft.revision += 1
+  return draft
 }
 
 export function addComment(

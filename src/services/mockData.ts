@@ -1,4 +1,4 @@
-import type { DataSystem, PrivacyRequest, WorkspaceState } from '@/types/domain'
+import type { DataSystem, DispatchBatch, PrivacyRequest, WorkspaceState } from '@/types/domain'
 import { addDays, buildWorkflowSteps } from './workflow'
 
 const systems: DataSystem[] = [
@@ -72,6 +72,14 @@ function audit(
   createdAt: string,
 ) {
   return { id, action, operator, detail, createdAt }
+}
+
+/** DSR-2026-006 限制处理生效后，同主体清除/更正系统任务统一的暂缓依据。 */
+const restrictionHold = {
+  restrictionRequestId: 'req-006',
+  restrictionCode: 'DSR-2026-006',
+  heldAt: '2026-09-30T03:20:00.000Z',
+  reason: '依据限制处理请求 DSR-2026-006 暂缓，未下发数据系统。',
 }
 
 export function createInitialState(): WorkspaceState {
@@ -169,7 +177,9 @@ export function createInitialState(): WorkspaceState {
         dueAt: request2Due,
         initialStatus: 'review-required',
         systems,
-      }),
+      }).map((step) =>
+        step.systemId ? { ...step, status: 'held' as const, hold: { ...restrictionHold } } : step,
+      ),
       evidence: [],
       conflicts: [
         '身份材料不足：授权书无法证明申请人与数据主体关系。',
@@ -184,6 +194,13 @@ export function createInitialState(): WorkspaceState {
           '隐私运营',
           '身份材料不足且检测到疑似重复请求。',
           '2026-09-19T02:00:00.000Z',
+        ),
+        audit(
+          'req-audit-002-b',
+          '任务暂缓下发',
+          '系统调度',
+          '同主体限制处理请求 DSR-2026-006 生效，删除系统任务停在待复核，未下发数据系统。',
+          '2026-09-30T03:20:00.000Z',
         ),
       ],
     },
@@ -338,11 +355,211 @@ export function createInitialState(): WorkspaceState {
         ),
       ],
     },
+    {
+      id: 'req-006',
+      code: 'DSR-2026-006',
+      requesterName: '王宁',
+      requesterContact: 'wa***@example.com',
+      region: 'eu',
+      type: 'restriction',
+      status: 'processing',
+      identity: {
+        status: 'verified',
+        materialType: 'masked-id',
+        maskedReference: '310***********8832',
+        protectedDigest: 'ID-771B',
+        note: '与 DSR-2026-005 同一主体，身份核验沿用受保护摘要。',
+        reviewedAt: '2026-09-30T03:10:00.000Z',
+      },
+      requestedAt: '2026-09-29T09:00:00.000Z',
+      dueAt: '2026-10-29T09:00:00.000Z',
+      extendedDays: 0,
+      affectedSystemIds: ['sys-crm', 'sys-marketing'],
+      tasks: buildWorkflowSteps({
+        requestId: 'req-006',
+        type: 'restriction',
+        systemIds: ['sys-crm', 'sys-marketing'],
+        requestedAt: '2026-09-29T09:00:00.000Z',
+        dueAt: '2026-10-29T09:00:00.000Z',
+        initialStatus: 'processing',
+        systems,
+      }),
+      evidence: [],
+      conflicts: [],
+      resultSummary: '',
+      closureReason: '',
+      audit: [
+        audit(
+          'req-audit-006-a',
+          '登记请求',
+          '客服专员',
+          '限制处理请求已登记，生成 30 日流程。',
+          '2026-09-29T09:00:00.000Z',
+        ),
+        audit(
+          'req-audit-006-b',
+          '身份核验通过',
+          '隐私运营',
+          '身份材料核验通过，限制处理生效。',
+          '2026-09-30T03:10:00.000Z',
+        ),
+        audit(
+          'req-audit-006-c',
+          '限制处理生效',
+          '系统调度',
+          '同主体清除与更正系统任务暂缓下发，等待限制解除或到期。',
+          '2026-09-30T03:20:00.000Z',
+        ),
+      ],
+    },
+    {
+      id: 'req-007',
+      code: 'DSR-2026-007',
+      requesterName: '王宁',
+      requesterContact: 'wa***@example.com',
+      region: 'eu',
+      type: 'rectification',
+      status: 'processing',
+      identity: {
+        status: 'verified',
+        materialType: 'masked-id',
+        maskedReference: '310***********8832',
+        protectedDigest: 'ID-771B',
+        note: '身份核验已完成。',
+        reviewedAt: '2026-09-26T07:00:00.000Z',
+      },
+      requestedAt: '2026-09-26T06:00:00.000Z',
+      dueAt: '2026-10-26T06:00:00.000Z',
+      extendedDays: 0,
+      affectedSystemIds: ['sys-crm', 'sys-archive'],
+      tasks: buildWorkflowSteps({
+        requestId: 'req-007',
+        type: 'rectification',
+        systemIds: ['sys-crm', 'sys-archive'],
+        requestedAt: '2026-09-26T06:00:00.000Z',
+        dueAt: '2026-10-26T06:00:00.000Z',
+        initialStatus: 'processing',
+        systems,
+      }).map((step) => {
+        if (step.id === 'req-007-locate-sys-crm') {
+          return { ...step, status: 'completed' as const, completedAt: '2026-09-27T02:00:00.000Z' }
+        }
+        if (step.id === 'req-007-execute-sys-crm') {
+          return { ...step, status: 'completed' as const, completedAt: '2026-09-28T02:30:00.000Z' }
+        }
+        if (step.id === 'req-007-locate-sys-archive' || step.id === 'req-007-execute-sys-archive') {
+          return { ...step, status: 'held' as const, hold: { ...restrictionHold } }
+        }
+        return step
+      }),
+      evidence: [
+        {
+          id: 'evidence-007-a',
+          stepId: 'req-007-execute-sys-crm',
+          name: '更正执行回执',
+          evidenceType: 'system-response',
+          digest: 'C72B-90E4',
+          uploadedBy: '客户平台组',
+          uploadedAt: '2026-09-28T02:35:00.000Z',
+          protected: true,
+        },
+      ],
+      conflicts: [],
+      resultSummary: '',
+      closureReason: '',
+      audit: [
+        audit(
+          'req-audit-007-a',
+          '登记请求',
+          '客服专员',
+          '更正请求已登记，生成 30 日流程。',
+          '2026-09-26T06:00:00.000Z',
+        ),
+        audit(
+          'req-audit-007-b',
+          '任务暂缓下发',
+          '系统调度',
+          '电子档案库相关任务依据限制处理请求 DSR-2026-006 停在待复核，未下发数据系统。',
+          '2026-09-30T03:20:00.000Z',
+        ),
+      ],
+    },
+  ]
+
+  const batches: DispatchBatch[] = [
+    {
+      id: 'batch-001',
+      label: 'BATCH-2026-001',
+      createdAt: '2026-09-27T01:00:00.000Z',
+      status: 'checkpointed',
+      checkpointNote:
+        '电子档案库维护中，接口暂停下发；已保留检查点，重试仅补未送达项，已成功回执不重发。',
+      checkpointAt: '2026-09-29T08:10:00.000Z',
+      items: [
+        {
+          id: 'dispatch-001',
+          requestId: 'req-007',
+          requestCode: 'DSR-2026-007',
+          taskId: 'req-007-locate-sys-crm',
+          taskName: '定位 客户关系管理系统 数据',
+          systemId: 'sys-crm',
+          systemName: '客户关系管理系统',
+          status: 'acknowledged',
+          attempts: 1,
+          registeredAt: '2026-09-27T01:00:00.000Z',
+          deliveredAt: '2026-09-27T01:05:00.000Z',
+          acknowledgedAt: '2026-09-27T02:00:00.000Z',
+          failureReason: '',
+        },
+        {
+          id: 'dispatch-002',
+          requestId: 'req-007',
+          requestCode: 'DSR-2026-007',
+          taskId: 'req-007-execute-sys-crm',
+          taskName: '执行更正：客户关系管理系统',
+          systemId: 'sys-crm',
+          systemName: '客户关系管理系统',
+          status: 'acknowledged',
+          attempts: 1,
+          registeredAt: '2026-09-28T01:30:00.000Z',
+          deliveredAt: '2026-09-28T01:35:00.000Z',
+          acknowledgedAt: '2026-09-28T02:30:00.000Z',
+          failureReason: '',
+        },
+        {
+          id: 'dispatch-003',
+          requestId: 'req-007',
+          requestCode: 'DSR-2026-007',
+          taskId: 'req-007-locate-sys-archive',
+          taskName: '定位 电子档案库 数据',
+          systemId: 'sys-archive',
+          systemName: '电子档案库',
+          status: 'failed',
+          attempts: 1,
+          registeredAt: '2026-09-29T08:00:00.000Z',
+          failureReason: '电子档案库维护中，接口暂停下发',
+        },
+        {
+          id: 'dispatch-004',
+          requestId: 'req-007',
+          requestCode: 'DSR-2026-007',
+          taskId: 'req-007-execute-sys-archive',
+          taskName: '执行更正：电子档案库',
+          systemId: 'sys-archive',
+          systemName: '电子档案库',
+          status: 'queued',
+          attempts: 0,
+          registeredAt: '2026-09-29T08:00:00.000Z',
+          failureReason: '',
+        },
+      ],
+    },
   ]
 
   return {
     requests,
     systems,
+    batches,
     comments: [
       {
         id: 'comment-001',
@@ -383,6 +600,21 @@ export function createInitialState(): WorkspaceState {
         operator: '数据管理员',
         detail: '风控平台与客户系统结果不一致，进入复核队列。',
         createdAt: '2026-09-28T08:30:00.000Z',
+      },
+      {
+        id: 'audit-global-4',
+        action: '对账批次保留检查点',
+        operator: '系统调度',
+        detail: 'BATCH-2026-001 在电子档案库遇到系统维护，已保留检查点；重试仅补未送达项，已成功回执不重发。',
+        createdAt: '2026-09-29T08:10:00.000Z',
+      },
+      {
+        id: 'audit-global-5',
+        requestId: 'req-006',
+        action: '限制处理生效',
+        operator: '系统调度',
+        detail: '同主体（王宁）的清除与更正系统任务暂缓下发，等待限制解除或到期。',
+        createdAt: '2026-09-30T03:20:00.000Z',
       },
     ],
     revision: 1,

@@ -39,7 +39,12 @@ export function DashboardPage() {
     (request) =>
       request.status === 'review-required' ||
       request.identity.status === 'insufficient' ||
-      request.conflicts.length > 0,
+      request.conflicts.length > 0 ||
+      request.tasks.some((task) => task.status === 'held'),
+  )
+  const heldTaskCount = data.requests.reduce(
+    (total, request) => total + request.tasks.filter((task) => task.status === 'held').length,
+    0,
   )
   const overdueRequests = openRequests.filter(
     (request) => new Date(request.dueAt).getTime() < Date.now(),
@@ -91,7 +96,7 @@ export function DashboardPage() {
             {reviewRequests.length}
           </Heading>
           <Text color="gray.500" fontSize="xs">
-            重复请求、身份材料不足或结果冲突
+            重复请求、身份材料不足或结果冲突{heldTaskCount ? `，含 ${heldTaskCount} 项限制暂缓任务` : ''}
           </Text>
         </Box>
         <Box className="metric warning">

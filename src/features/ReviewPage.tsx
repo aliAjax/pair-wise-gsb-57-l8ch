@@ -69,8 +69,18 @@ export function ReviewPage() {
           request.identity.status === 'insufficient' ||
           request.duplicateOf ||
           request.conflicts.length > 0 ||
+          request.tasks.some((task) => task.status === 'held') ||
           new Date(request.dueAt).getTime() < Date.now(),
       ) ?? [],
+    [data],
+  )
+
+  const heldTaskCount = useMemo(
+    () =>
+      (data?.requests ?? []).reduce(
+        (total, request) => total + request.tasks.filter((task) => task.status === 'held').length,
+        0,
+      ),
     [data],
   )
 
@@ -144,7 +154,7 @@ export function ReviewPage() {
         截止时间前关闭请求必须填写提前关闭理由，本页面只提供身份、冲突和延期复核动作。
       </Alert>
 
-      <SimpleGrid columns={4} spacing="4" mb="5">
+      <SimpleGrid columns={5} spacing="4" mb="5">
         <Box className="metric danger">
           <Text color="gray.600" fontSize="sm">
             队列总数
@@ -175,6 +185,14 @@ export function ReviewPage() {
           </Text>
           <Heading mt="2" size="md">
             {queue.filter((request) => request.duplicateOf).length}
+          </Heading>
+        </Box>
+        <Box className="metric warning">
+          <Text color="gray.600" fontSize="sm">
+            限制暂缓任务
+          </Text>
+          <Heading mt="2" size="md">
+            {heldTaskCount}
           </Heading>
         </Box>
       </SimpleGrid>
@@ -211,6 +229,17 @@ export function ReviewPage() {
                         {request.duplicateOf ? (
                           <Badge colorScheme="orange">疑似重复 {request.duplicateOf}</Badge>
                         ) : null}
+                        {[
+                          ...new Set(
+                            request.tasks
+                              .filter((task) => task.status === 'held' && task.hold)
+                              .map((task) => task.hold?.restrictionCode ?? ''),
+                          ),
+                        ].map((code) => (
+                          <Badge key={code} colorScheme="purple">
+                            限制暂缓 · 依据 {code}
+                          </Badge>
+                        ))}
                         {request.conflicts.map((conflict, index) => (
                           <Text key={`${conflict}-${index}`} fontSize="sm">
                             {conflict}

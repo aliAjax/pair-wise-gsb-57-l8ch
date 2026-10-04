@@ -7,9 +7,12 @@ import {
   closeRequest,
   createRequest,
   extendRequest,
+  liftRestriction,
   recordExport,
   resolveConflict,
+  retryBatch,
   saveRequest,
+  syncSchedule,
   taskAction,
   verifyIdentity,
 } from '@/services/requestService'
@@ -23,9 +26,12 @@ import {
   evidenceInputSchema,
   extendRequestInputSchema,
   identityInputSchema,
+  liftRestrictionInputSchema,
   recordExportInputSchema,
   resolveConflictInputSchema,
+  retryBatchInputSchema,
   saveRequestInputSchema,
+  syncScheduleInputSchema,
   taskActionInputSchema,
 } from '@/lib/schemas'
 import type { WorkspaceState } from '@/types/domain'
@@ -167,6 +173,23 @@ export const appRouter = t.router({
           recordExport(input.state, input.scope, input.count, input.operator),
         ),
       ),
+    liftRestriction: publicProcedure
+      .input(liftRestrictionInputSchema)
+      .mutation(({ input }) =>
+        execute(() =>
+          liftRestriction(input.state, input.requestId, input.note, input.operator),
+        ),
+      ),
+  }),
+  schedule: t.router({
+    retryBatch: publicProcedure
+      .input(retryBatchInputSchema)
+      .mutation(({ input }) =>
+        execute(() => retryBatch(input.state, input.batchId, input.operator)),
+      ),
+    sync: publicProcedure
+      .input(syncScheduleInputSchema)
+      .mutation(({ input }) => execute(() => syncSchedule(input.state, input.operator))),
   }),
 })
 

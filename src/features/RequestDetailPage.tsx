@@ -48,6 +48,7 @@ import {
   useAssignTaskMutation,
   useCloseRequestMutation,
   useExtendRequestMutation,
+  useLiftRestrictionMutation,
   useResolveConflictMutation,
   useSaveRequestMutation,
   useTaskActionMutation,
@@ -55,8 +56,10 @@ import {
   useWorkspaceQuery,
 } from '@/lib/hooks'
 import {
+  dispatchStatusLabels,
   regionLabels,
   requestTypeLabels,
+  taskStatusLabels,
   type Region,
   type RequestType,
   type WorkflowStep,
@@ -73,6 +76,7 @@ type DialogType =
   | 'resolve'
   | 'extend'
   | 'close'
+  | 'lift'
   | null
 
 export function RequestDetailPage({ requestId }: { requestId: string }) {
@@ -107,10 +111,21 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const resolveConflict = useResolveConflictMutation()
   const extendRequest = useExtendRequestMutation()
   const closeRequest = useCloseRequestMutation()
+  const liftRestriction = useLiftRestrictionMutation()
   const addComment = useAddCommentMutation()
 
   const comments = useMemo(
     () => data?.comments.filter((comment) => comment.requestId === requestId) ?? [],
+    [data, requestId],
+  )
+
+  const dispatchItems = useMemo(
+    () =>
+      (data?.batches ?? []).flatMap((batch) =>
+        batch.items
+          .filter((item) => item.requestId === requestId)
+          .map((item) => ({ ...item, batchLabel: batch.label })),
+      ),
     [data, requestId],
   )
 
@@ -120,7 +135,25 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
   const deadline = deadlineState(request.dueAt)
   const completedTasks = request.tasks.filter((task) => task.status === 'completed').length
   const currentTask = request.tasks.find((task) => task.status === 'active')
+  const heldTasks = request.tasks.filter((task) => task.status === 'held')
+  const heldByCodes = [
+    ...new Set(heldTasks.map((task) => task.hold?.restrictionCode ?? '').filter(Boolean)),
+  ]
   const systems = data.systems.filter((system) => request.affectedSystemIds.includes(system.id))
+  const restrictionState =
+    request.type === 'restriction'
+      ? ['completed', 'rejected'].includes(request.status)
+        ? { label: '已解除', color: 'gray' }
+        : new Date(request.dueAt).getTime() < Date.now()
+          ? { label: '已到期', color: 'orange' }
+          : { label: '生效中', color: 'purple' }
+      : null
+  const heldByThisRestriction =
+    request.type === 'restriction'
+      ? data.requests
+          .flatMap((item) => item.tasks)
+          .filter((task) => task.hold?.restrictionRequestId === request.id).length
+      : 0
 
   function openDialog(type: DialogType, task?: WorkflowStep, index = 0) {
     if (!request) return
@@ -256,19 +289,40 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           }),
         '请求已完成并关闭',
       )
+    } else if (dialog === 'lift') {
+      await run(
+        () =>
+          liftRestriction.mutateAsync({
+            requestId,
+            note: content,
+            operator: '隐私负责人',
+          }),
+        '限制已解除，暂缓任务按原登记顺序恢复下发',
+      )
     }
   }
 
   async function taskMutation(task: WorkflowStep, action: 'start' | 'complete') {
     try {
-      await taskAction.mutateAsync({
+      const next = await taskAction.mutateAsync({
         requestId,
         taskId: task.id,
         action,
         note: action === 'start' ? '开始执行任务。' : '任务结果已提交。',
         operator: task.assignee || '数据管理员',
       })
-      toast({ title: action === 'start' ? '任务已开始' : '任务已完成', status: 'success' })
+      const updated = next.requests
+        .find((item) => item.id === requestId)
+        ?.tasks.find((item) => item.id === task.id)
+      if (updated?.status === 'held') {
+        toast({
+          title: '任务已暂缓，停在待复核',
+          description: updated.hold?.reason ?? '存在生效中的限制处理请求，未下发数据系统。',
+          status: 'warning',
+        })
+      } else {
+        toast({ title: action === 'start' ? '任务已开始' : '任务已完成', status: 'success' })
+      }
     } catch (error) {
       toast({
         title: '任务状态未更新',
@@ -288,6 +342,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
     resolve: '记录冲突复核结论',
     extend: '延期处理请求',
     close: '关闭请求并合并结果',
+    lift: '解除限制处理',
   }
 
   return (
@@ -305,6 +360,11 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             <Button variant="outline" onClick={() => openDialog('edit')}>
               编辑信息
             </Button>
+            {request.type === 'restriction' && !['completed', 'rejected'].includes(request.status) ? (
+              <Button colorScheme="purple" variant="outline" onClick={() => openDialog('lift')}>
+                解除限制
+              </Button>
+            ) : null}
             <Button colorScheme="brand" onClick={() => openDialog('close')}>
               完成并关闭
             </Button>
@@ -365,6 +425,24 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
       {request.conflicts.length ? (
         <Alert status="error" mb="4" borderRadius="5px">
           当前请求处于复核状态：{request.conflicts.join('；')}
+        </Alert>
+      ) : null}
+      {heldTasks.length ? (
+        <Alert status="warning" mb="4" borderRadius="5px">
+          {heldTasks.length} 项系统任务依据限制处理请求 {heldByCodes.join('、')}{' '}
+          暂缓，停在待复核且未下发数据系统；限制解除或到期后按原登记顺序重新下发。
+        </Alert>
+      ) : null}
+      {restrictionState ? (
+        <Alert
+          status={restrictionState.label === '生效中' ? 'info' : 'success'}
+          mb="4"
+          borderRadius="5px"
+        >
+          限制处理{restrictionState.label}
+          {restrictionState.label === '生效中'
+            ? `：当前暂缓同主体 ${heldByThisRestriction} 项清除/更正系统任务。`
+            : '：同主体暂缓任务已按原登记顺序恢复排程。'}
         </Alert>
       ) : null}
       {request.duplicateOf ? (
@@ -509,6 +587,11 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                 阻断并复核
               </Button>
             </VStack>
+          ) : heldTasks.length ? (
+            <Alert status="warning" borderRadius="5px">
+              {heldTasks.length} 项任务停在待复核：依据限制处理请求 {heldByCodes.join('、')}{' '}
+              暂缓下发，限制解除或到期后自动恢复排程。
+            </Alert>
           ) : (
             <Alert status="success" borderRadius="5px">
               当前没有活动任务，可检查冲突并关闭请求。
@@ -536,7 +619,7 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
             {request.tasks.map((task) => (
               <Box
                 key={task.id}
-                className={`timeline-item ${task.status === 'active' ? 'active' : ''} ${task.status === 'blocked' ? 'blocked' : ''}`}
+                className={`timeline-item ${task.status === 'active' ? 'active' : ''} ${task.status === 'blocked' ? 'blocked' : ''} ${task.status === 'held' ? 'held' : ''}`}
               >
                 <Flex justify="space-between" gap="4">
                   <Box>
@@ -547,6 +630,11 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                     <Text mt="1" color="gray.600" fontSize="sm">
                       {task.role} · {task.assignee}
                     </Text>
+                    {task.hold ? (
+                      <Text mt="1" color="purple.600" fontSize="sm">
+                        {task.hold.reason}（{new Date(task.hold.heldAt).toLocaleString('zh-CN')}）
+                      </Text>
+                    ) : null}
                     {task.exceptionReason ? (
                       <Text mt="1" color="red.600" fontSize="sm">
                         {task.exceptionReason}
@@ -562,16 +650,12 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                             ? 'blue'
                             : task.status === 'blocked'
                               ? 'red'
-                              : 'gray'
+                              : task.status === 'held'
+                                ? 'purple'
+                                : 'gray'
                       }
                     >
-                      {task.status === 'completed'
-                        ? '已完成'
-                        : task.status === 'active'
-                          ? '执行中'
-                          : task.status === 'blocked'
-                            ? '已阻断'
-                            : '未开始'}
+                      {taskStatusLabels[task.status]}
                     </Badge>
                     <HStack spacing="1">
                       <Button size="xs" variant="ghost" onClick={() => openDialog('assign', task)}>
@@ -640,6 +724,68 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
           </VStack>
         </Box>
       </div>
+
+      <Box className="panel">
+        <Flex className="panel-title">
+          <Heading size="sm">系统下发与回执</Heading>
+          <Badge colorScheme={dispatchItems.some((item) => item.status === 'failed') ? 'red' : 'blue'}>
+            {dispatchItems.length} 条下发记录
+          </Badge>
+        </Flex>
+        {dispatchItems.length ? (
+          <TableContainer>
+            <Table size="sm">
+              <Thead>
+                <Tr>
+                  <Th>对账批次</Th>
+                  <Th>任务</Th>
+                  <Th>目标系统</Th>
+                  <Th>状态</Th>
+                  <Th>尝试次数</Th>
+                  <Th>说明</Th>
+                </Tr>
+              </Thead>
+              <Tbody>
+                {dispatchItems.map((item) => (
+                  <Tr key={item.id}>
+                    <Td className="mono">{item.batchLabel}</Td>
+                    <Td>{item.taskName}</Td>
+                    <Td>{item.systemName}</Td>
+                    <Td>
+                      <Badge
+                        colorScheme={
+                          item.status === 'acknowledged'
+                            ? 'green'
+                            : item.status === 'delivered'
+                              ? 'blue'
+                              : item.status === 'failed'
+                                ? 'red'
+                                : 'gray'
+                        }
+                      >
+                        {dispatchStatusLabels[item.status]}
+                      </Badge>
+                    </Td>
+                    <Td>{item.attempts}</Td>
+                    <Td whiteSpace="normal">
+                      {item.failureReason ||
+                        (item.acknowledgedAt
+                          ? `回执时间 ${new Date(item.acknowledgedAt).toLocaleString('zh-CN')}`
+                          : item.deliveredAt
+                            ? `送达时间 ${new Date(item.deliveredAt).toLocaleString('zh-CN')}`
+                            : '等待发送')}
+                    </Td>
+                  </Tr>
+                ))}
+              </Tbody>
+            </Table>
+          </TableContainer>
+        ) : (
+          <Text color="gray.500" fontSize="sm">
+            暂无下发记录：任务开始执行或暂缓恢复后会登记对账批次与回执。
+          </Text>
+        )}
+      </Box>
 
       <div className="two-column">
         <Box className="panel">
@@ -873,6 +1019,23 @@ export function RequestDetailPage({ requestId }: { requestId: string }) {
                   }
                 />
               </FormControl>
+            ) : null}
+
+            {dialog === 'lift' ? (
+              <VStack align="stretch" spacing="4">
+                <Alert status="warning" borderRadius="5px">
+                  解除后，同主体 {heldByThisRestriction}{' '}
+                  项暂缓任务将按原登记顺序重新下发数据系统；已成功回执的项不会重发或覆盖。
+                </Alert>
+                <FormControl isRequired>
+                  <FormLabel>解除依据</FormLabel>
+                  <Textarea
+                    value={content}
+                    onChange={(event) => setContent(event.target.value)}
+                    placeholder="说明限制解除或撤回的依据，将写入审计"
+                  />
+                </FormControl>
+              </VStack>
             ) : null}
 
             {dialog === 'extend' ? (

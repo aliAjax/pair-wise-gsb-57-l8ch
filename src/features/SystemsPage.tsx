@@ -18,14 +18,26 @@ import {
   Thead,
   Tr,
   VStack,
+  useToast,
 } from '@chakra-ui/react'
 import { PageHeader } from '@/components/PageHeader'
-import { useWorkspaceQuery } from '@/lib/hooks'
+import {
+  useRetryBatchMutation,
+  useSyncScheduleMutation,
+  useWorkspaceQuery,
+} from '@/lib/hooks'
 import { useWorkspaceStore } from '@/stores/workspaceStore'
-import { requestTypeLabels, systemStatusLabels } from '@/lib/schemas'
+import {
+  batchStatusLabels,
+  requestTypeLabels,
+  systemStatusLabels,
+} from '@/lib/schemas'
 
 export function SystemsPage() {
+  const toast = useToast()
   const { data, isLoading } = useWorkspaceQuery()
+  const retryBatch = useRetryBatchMutation()
+  const syncSchedule = useSyncScheduleMutation()
   const store = useWorkspaceStore()
 
   if (isLoading || !data) return <Box className="panel">正在加载系统清单...</Box>
@@ -38,6 +50,36 @@ export function SystemsPage() {
   const activeRequests = data.requests.filter(
     (request) => !['completed', 'rejected'].includes(request.status),
   )
+
+  async function runSyncSchedule() {
+    try {
+      await syncSchedule.mutateAsync({ operator: '隐私运营' })
+      toast({ title: '排程已按限制处理与批次状态重算', status: 'success' })
+    } catch (error) {
+      toast({
+        title: '重算排程失败',
+        description: error instanceof Error ? error.message : '请重试',
+        status: 'error',
+      })
+    }
+  }
+
+  async function runRetry(batchId: string) {
+    try {
+      await retryBatch.mutateAsync({ batchId, operator: '隐私运营' })
+      toast({
+        title: '批次重试完成',
+        description: '仅补发未送达项，已成功回执项未重发。',
+        status: 'success',
+      })
+    } catch (error) {
+      toast({
+        title: '批次重试未完成',
+        description: error instanceof Error ? error.message : '请重试',
+        status: 'error',
+      })
+    }
+  }
 
   return (
     <Box>
@@ -135,6 +177,95 @@ export function SystemsPage() {
             </Tbody>
           </Table>
         </TableContainer>
+      </Box>
+
+      <Box className="panel">
+        <Flex className="panel-title">
+          <Heading size="sm">调度批次与检查点</Heading>
+          <Button
+            size="xs"
+            variant="ghost"
+            isLoading={syncSchedule.isPending}
+            onClick={() => void runSyncSchedule()}
+          >
+            重算排程
+          </Button>
+        </Flex>
+        {data.batches.length ? (
+          <TableContainer>
+            <Table size="sm">
+              <Thead>
+                <Tr>
+                  <Th>对账批次</Th>
+                  <Th>状态</Th>
+                  <Th>待发送</Th>
+                  <Th>已送达</Th>
+                  <Th>已回执</Th>
+                  <Th>失败</Th>
+                  <Th>检查点说明</Th>
+                  <Th>操作</Th>
+                </Tr>
+              </Thead>
+              <Tbody>
+                {data.batches.map((batch) => {
+                  const count = (status: string) =>
+                    batch.items.filter((item) => item.status === status).length
+                  const retryable = count('failed') + count('queued')
+                  return (
+                    <Tr key={batch.id}>
+                      <Td>
+                        <Text fontWeight="600" className="mono">
+                          {batch.label}
+                        </Text>
+                        <Text color="gray.500" fontSize="xs">
+                          {new Date(batch.createdAt).toLocaleString('zh-CN')}
+                        </Text>
+                      </Td>
+                      <Td>
+                        <Badge
+                          colorScheme={
+                            batch.status === 'settled'
+                              ? 'green'
+                              : batch.status === 'checkpointed'
+                                ? 'orange'
+                                : 'blue'
+                          }
+                        >
+                          {batchStatusLabels[batch.status]}
+                        </Badge>
+                      </Td>
+                      <Td>{count('queued')}</Td>
+                      <Td>{count('delivered')}</Td>
+                      <Td>{count('acknowledged')}</Td>
+                      <Td color={count('failed') ? 'red.600' : undefined} fontWeight="600">
+                        {count('failed')}
+                      </Td>
+                      <Td maxW="320px" whiteSpace="normal">
+                        <Text fontSize="sm">{batch.checkpointNote || '—'}</Text>
+                      </Td>
+                      <Td>
+                        <Button
+                          size="xs"
+                          variant="link"
+                          colorScheme="brand"
+                          isDisabled={!retryable}
+                          isLoading={retryBatch.isPending}
+                          onClick={() => void runRetry(batch.id)}
+                        >
+                          重试未送达项
+                        </Button>
+                      </Td>
+                    </Tr>
+                  )
+                })}
+              </Tbody>
+            </Table>
+          </TableContainer>
+        ) : (
+          <Text color="gray.500" fontSize="sm">
+            暂无调度批次：任务下发数据系统后会生成对账批次与检查点。
+          </Text>
+        )}
       </Box>
 
       <Box className="panel">

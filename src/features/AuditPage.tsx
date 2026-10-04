@@ -66,6 +66,17 @@ export function AuditPage() {
   const workspace = data
 
   function sanitizedPackage() {
+    const heldTasks = workspace.requests.flatMap((request) =>
+      request.tasks
+        .filter((task) => task.status === 'held')
+        .map((task) => ({
+          requestCode: request.code,
+          taskName: task.name,
+          restrictionCode: task.hold?.restrictionCode ?? '',
+          reason: task.hold?.reason ?? '',
+          heldAt: task.hold?.heldAt ?? '',
+        })),
+    )
     return {
       exportedAt: new Date().toISOString(),
       policy: '用户隐私权利请求履约操作规范 v1',
@@ -75,6 +86,8 @@ export function AuditPage() {
           (request) => !['completed', 'rejected'].includes(request.status),
         ).length,
         systemCount: workspace.systems.length,
+        heldTaskCount: heldTasks.length,
+        dispatchBatchCount: workspace.batches.length,
       },
       requests: workspace.requests.map((request) => ({
         code: request.code,
@@ -102,6 +115,13 @@ export function AuditPage() {
           assignee: task.assignee,
           completedAt: task.completedAt,
           exceptionReason: task.exceptionReason,
+          hold: task.hold
+            ? {
+                restrictionCode: task.hold.restrictionCode,
+                reason: task.hold.reason,
+                heldAt: task.hold.heldAt,
+              }
+            : null,
         })),
         evidence: request.evidence.map((evidence) => ({
           name: evidence.name,
@@ -112,6 +132,23 @@ export function AuditPage() {
         conflicts: request.conflicts,
         resultSummary: request.resultSummary,
         closureReason: request.closureReason,
+      })),
+      heldTasks,
+      dispatchBatches: workspace.batches.map((batch) => ({
+        label: batch.label,
+        status: batch.status,
+        checkpointNote: batch.checkpointNote,
+        checkpointAt: batch.checkpointAt,
+        items: batch.items.map((item) => ({
+          requestCode: item.requestCode,
+          taskName: item.taskName,
+          systemName: item.systemName,
+          status: item.status,
+          attempts: item.attempts,
+          failureReason: item.failureReason,
+          deliveredAt: item.deliveredAt,
+          acknowledgedAt: item.acknowledgedAt,
+        })),
       })),
       audit: auditEntries,
     }
@@ -239,7 +276,7 @@ export function AuditPage() {
           <Badge colorScheme="green">已校验</Badge>
         </Flex>
         <Text color="gray.600" fontSize="sm">
-          导出内容仅包含掩码身份引用、摘要、任务状态、证据元数据和审计记录；系统不会导出原始身份材料。
+          导出内容仅包含掩码身份引用、摘要、任务状态、暂缓任务及其限制处理依据、对账批次检查点、证据元数据和审计记录；系统不会导出原始身份材料。
         </Text>
       </Box>
     </Box>
